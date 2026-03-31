@@ -196,7 +196,7 @@ def validate_file(path: Path, kind: str = "auto") -> list[str]:
         return errors
 
     seen_ids: set[str] = set()
-    seen_source_iris: set[str] = set()
+    seen_ledger_pairs: set[tuple[str, str]] = set()
     for line_no, row in enumerate(rows, start=2):
         alignment_id = (row.get("alignment_id", "") or "").strip()
         left_source = (
@@ -285,9 +285,14 @@ def validate_file(path: Path, kind: str = "auto") -> list[str]:
                 errors.append(f"Row {line_no}: duplicate alignment_id: {alignment_id}")
             seen_ids.add(alignment_id)
         else:
-            if left_iri in seen_source_iris:
-                errors.append(f"Row {line_no}: duplicate source_term_iri: {left_iri}")
-            seen_source_iris.add(left_iri)
+            ledger_pair = (left_iri, canonical_term_iri)
+            if ledger_pair in seen_ledger_pairs:
+                errors.append(
+                    "Row "
+                    f"{line_no}: duplicate source_term_iri/canonical_term_iri pair: "
+                    f"{left_iri} -> {canonical_term_iri}"
+                )
+            seen_ledger_pairs.add(ledger_pair)
 
         if queue_mode and not is_valid_score(match_score):
             errors.append(f"Row {line_no}: match_score must be between 0 and 1")

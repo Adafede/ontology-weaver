@@ -336,8 +336,10 @@ def should_track_review_row(row: dict[str, object] | pd.Series) -> bool:
 
 
 def ledger_identity(row: dict[str, object] | pd.Series) -> str:
-    """Use source term IRI as the shared-ledger identity."""
-    return str((row.get("source_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    """Use (source term IRI, canonical term IRI) as the shared-ledger identity."""
+    source_iri = str((row.get("source_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    canonical_iri = str((row.get("canonical_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    return f"{source_iri}\t{canonical_iri}"
 
 
 def project_review_row(row: dict[str, object] | pd.Series) -> dict[str, str]:
