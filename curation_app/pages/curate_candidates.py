@@ -16,9 +16,10 @@ from rdflib import Graph, URIRef
 from rdflib.namespace import OWL, RDF, RDFS, SKOS
 
 from curation_app.config import DEFAULT_OLS_ONTOLOGIES_FILE
-from curation_app.context import active_source_context
+from curation_app.context import active_alignment_context, stamp_batch_metadata, stamp_batch_record
 from curation_app.helpers import (
     dataframe_to_tsv_bytes,
+    normalize_source_value,
     normalize_notes_for_approval,
     read_tsv,
     render_clickable_dataframe,
@@ -31,6 +32,10 @@ from curation_app.helpers import (
 
 
 REQUIRED_COLUMNS = [
+    "batch_id",
+    "pivot_source",
+    "target_id",
+    "target_backend",
     "alignment_id",
     "left_source",
     "left_term_iri",
@@ -244,9 +249,9 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _load_df(path_text: str) -> pd.DataFrame:
+def _load_df(path_text: str, ctx) -> pd.DataFrame:
     df = read_tsv(path_text)
-    return _ensure_columns(df)
+    return stamp_batch_metadata(_ensure_columns(df), ctx)
 
 
 def _file_mtime(path_text: str) -> float | None:
@@ -258,8 +263,14 @@ def _file_mtime(path_text: str) -> float | None:
 
 def _save_queue_and_sync_review(queue_file: str, review_file: str) -> None:
     queue_df = st.session_state[STATE_DF]
+    ctx = active_alignment_context()
+    if ctx is not None:
+        queue_df = stamp_batch_metadata(queue_df, ctx)
+        st.session_state[STATE_DF] = queue_df
     write_tsv(queue_df, queue_file)
     review_df = read_tsv(review_file)
+    if ctx is not None:
+        review_df = stamp_batch_metadata(review_df, ctx)
     touched_source_iris = set(str(x or "").strip() for x in st.session_state.get(STATE_REVIEW_SYNC_IRIS, set()))
     synced_review_df = sync_review_ledger(review_df, queue_df, touched_source_iris=touched_source_iris)
     write_tsv(synced_review_df, review_file)
@@ -307,7 +318,7 @@ def _apply_approve_left(df: pd.DataFrame, idx: int, reviewer: str, relation: str
     df.at[idx, "canonical_from"] = "left"
     df.at[idx, "canonical_term_iri"] = df.at[idx, "left_term_iri"]
     df.at[idx, "canonical_term_label"] = df.at[idx, "left_label"]
-    df.at[idx, "canonical_term_source"] = df.at[idx, "left_source"]
+    df.at[idx, "canonical_term_source"] = normalize_source_value(df.at[idx, "left_source"])
     df.at[idx, "canonical_term_kind"] = df.at[idx, "left_term_kind"]
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -320,7 +331,7 @@ def _apply_approve_right(df: pd.DataFrame, idx: int, reviewer: str, relation: st
     df.at[idx, "canonical_from"] = "right"
     df.at[idx, "canonical_term_iri"] = df.at[idx, "right_term_iri"]
     df.at[idx, "canonical_term_label"] = df.at[idx, "right_label"]
-    df.at[idx, "canonical_term_source"] = df.at[idx, "right_source"]
+    df.at[idx, "canonical_term_source"] = normalize_source_value(df.at[idx, "right_source"])
     df.at[idx, "canonical_term_kind"] = df.at[idx, "right_term_kind"]
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -346,7 +357,7 @@ def _apply_approve_manual(
     df.at[idx, "canonical_from"] = "manual"
     df.at[idx, "canonical_term_iri"] = manual_iri.strip()
     df.at[idx, "canonical_term_label"] = manual_label.strip()
-    df.at[idx, "canonical_term_source"] = manual_source.strip()
+    df.at[idx, "canonical_term_source"] = normalize_source_value(manual_source)
     df.at[idx, "canonical_term_kind"] = manual_kind.strip()
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -1525,15 +1536,16 @@ def render() -> None:
         unsafe_allow_html=True,
     )
 
-    ctx = active_source_context()
+    ctx = active_alignment_context()
     if ctx is None:
-        st.warning("No source slug available. Configure sources in Download External Sources first.")
+        st.warning("No alignment batch found. Configure registry/alignment_batches.tsv first.")
         return
 
     queue_file = to_relpath(ctx.queue_tsv)
     review_file = to_relpath(ctx.review_tsv)
-    st.caption(f"Local queue: `{queue_file}`")
-    st.caption(f"Review ledger: `{review_file}`")
+    st.caption(f"Active batch: `{ctx.batch_label}`")
+    st.caption(f"Batch queue: `{queue_file}`")
+    st.caption(f"Batch review ledger: `{review_file}`")
     active_curator = str(st.session_state.get(STATE_CURATOR, "") or "").strip()
     active_curator_name = str(st.session_state.get(STATE_CURATOR_NAME, "") or "").strip()
     if active_curator and active_curator_name:
@@ -1548,7 +1560,7 @@ def render() -> None:
         or STATE_DF not in st.session_state
     ):
         st.session_state[STATE_PATH] = queue_file
-        st.session_state[STATE_DF] = _load_df(queue_file)
+        st.session_state[STATE_DF] = _load_df(queue_file, ctx)
         st.session_state[STATE_DIRTY] = False
         st.session_state[STATE_MTIME] = _file_mtime(queue_file)
         st.session_state[STATE_KEPT_LEFT_TERMS] = []
@@ -1571,7 +1583,7 @@ def render() -> None:
                 "Use 'Reload from disk' to refresh."
             )
         else:
-            st.session_state[STATE_DF] = _load_df(queue_file)
+            st.session_state[STATE_DF] = _load_df(queue_file, ctx)
             st.session_state[STATE_MTIME] = current_mtime
             st.session_state[STATE_PENDING_APPROVALS] = {}
             st.session_state[STATE_SELECTED_ALIGNMENT] = ""
@@ -1580,7 +1592,7 @@ def render() -> None:
     col_reload, col_save = st.columns(2)
     with col_reload:
         if st.button("Reload from disk"):
-            st.session_state[STATE_DF] = _load_df(queue_file)
+            st.session_state[STATE_DF] = _load_df(queue_file, ctx)
             st.session_state[STATE_DIRTY] = False
             st.session_state[STATE_MTIME] = _file_mtime(queue_file)
             st.session_state[STATE_REVIEW_SYNC_IRIS] = set()
@@ -1606,10 +1618,11 @@ def render() -> None:
         else:
             st.info(f"{catalog_msg} Mapping relation selection remains optional on this page.")
 
-    df = st.session_state[STATE_DF]
-    review_df = read_tsv(review_file)
+    df = stamp_batch_metadata(st.session_state[STATE_DF], ctx)
+    st.session_state[STATE_DF] = df
+    review_df = stamp_batch_metadata(read_tsv(review_file), ctx)
     if df.empty and not to_path(queue_file).is_file():
-        st.warning("No local queue found for this source. Please run Generate Pairwise Candidates first.")
+        st.warning("No local queue found for this batch. Please run Generate Pairwise Candidates first.")
         return
 
     term_groups = (
@@ -1668,13 +1681,36 @@ def render() -> None:
         options=available_statuses,
         default=default_statuses,
     )
+    include_shared_approved = st.checkbox(
+        "Include terms already approved in shared ledger",
+        value=False,
+        help=(
+            "Off by default so normal curation focuses on unresolved terms. "
+            "Enable only when you intentionally want to revisit already approved shared decisions."
+        ),
+    )
     search_text = st.text_input("Search (left/right labels, logs, curation comments)", value="")
 
     filtered = _filtered_df(df, selected_statuses, search_text)
-    st.caption(f"Filtered rows: {len(filtered)}")
+    reviewable_filtered = filtered.copy()
+    hidden_shared_rows = 0
+    if not include_shared_approved and not review_df.empty and "source_term_iri" in review_df.columns:
+        approved_shared_iris = {
+            str(value or "").strip()
+            for value in review_df["source_term_iri"].astype(str).tolist()
+            if str(value or "").strip()
+        }
+        if approved_shared_iris:
+            mask = reviewable_filtered["left_term_iri"].astype(str).isin(approved_shared_iris)
+            hidden_shared_rows = int(mask.sum())
+            reviewable_filtered = reviewable_filtered.loc[~mask].copy()
+    if hidden_shared_rows:
+        st.caption(f"Filtered rows: {len(filtered)} | hidden because already approved in shared ledger: {hidden_shared_rows}")
+    else:
+        st.caption(f"Filtered rows: {len(filtered)}")
 
     left_terms_df = (
-        filtered[
+        reviewable_filtered[
             [
                 "left_source",
                 "left_term_iri",
@@ -2032,7 +2068,7 @@ def render() -> None:
                     right_kind=resolved_kind,
                 )
 
-                new_row = {col: "" for col in df.columns}
+                new_row = stamp_batch_record({col: "" for col in df.columns}, ctx)
                 new_row["alignment_id"] = _next_alignment_id(df)
                 new_row["left_source"] = left_source
                 new_row["left_term_iri"] = left_iri
@@ -2041,7 +2077,7 @@ def render() -> None:
                 new_row["left_comment"] = str(left_row_series.get("left_comment", "") or "")
                 new_row["left_example"] = str(left_row_series.get("left_example", "") or "")
                 new_row["left_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
-                new_row["right_source"] = metadata_ontology.upper()
+                new_row["right_source"] = normalize_source_value(metadata_ontology)
                 new_row["right_term_iri"] = iri_clean
                 new_row["right_label"] = right_label_value
                 new_row["right_definition"] = metadata["definition"]
@@ -2082,8 +2118,9 @@ def render() -> None:
                 if "normalized_right_label" in df.columns:
                     new_row["normalized_right_label"] = str(right_label_value).strip().lower()
 
+                stamped_row = stamp_batch_record(new_row, ctx)
                 st.session_state[STATE_DF] = pd.concat(
-                    [st.session_state[STATE_DF], pd.DataFrame([new_row], columns=df.columns)],
+                    [st.session_state[STATE_DF], pd.DataFrame([stamped_row], columns=df.columns)],
                     ignore_index=True,
                 )
                 st.session_state[STATE_DIRTY] = True
@@ -2331,7 +2368,7 @@ def render() -> None:
                 _set_review_fields(df, idx, active_curator)
 
             if left_is_kept and carrier_idx is None:
-                new_row = {col: "" for col in df.columns}
+                new_row = stamp_batch_record({col: "" for col in df.columns}, ctx)
                 new_row["alignment_id"] = _next_alignment_id(df)
                 new_row["left_source"] = left_source
                 new_row["left_term_iri"] = left_iri

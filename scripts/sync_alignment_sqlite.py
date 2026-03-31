@@ -17,6 +17,10 @@ from pathlib import Path
 
 
 PAIR_ALIGNMENT_COLUMNS = [
+    "batch_id",
+    "pivot_source",
+    "target_id",
+    "target_backend",
     "alignment_id",
     "left_source",
     "left_term_iri",
@@ -45,6 +49,11 @@ PAIR_ALIGNMENT_COLUMNS = [
 RECONCILED_MAPPING_COLUMNS = [
     "mapping_id",
     "alignment_id",
+    "batch_id",
+    "pivot_source",
+    "target_id",
+    "target_backend",
+    "mapping_origin",
     "source_term_source",
     "source_term_iri",
     "source_term_label",
@@ -122,12 +131,25 @@ def clean(value: str) -> str:
     return (value or "").strip()
 
 
+def normalize_source(value: str) -> str:
+    """Return normalized lowercase source identifier."""
+    return clean(value).lower()
+
+
 def stable_alignment_id(row: dict[str, str]) -> str:
     """Return queue alignment_id or derive a stable internal ID for shared-ledger rows."""
     explicit = clean(row.get("alignment_id", ""))
     if explicit:
         return explicit
+    batch_id = clean(row.get("batch_id", ""))
     source_term_iri = clean(row.get("source_term_iri", "")) or clean(row.get("left_term_iri", ""))
+    canonical_term_iri = clean(row.get("canonical_term_iri", ""))
+    if batch_id and source_term_iri and canonical_term_iri:
+        return f"LEDGER::{batch_id}::{source_term_iri}::{canonical_term_iri}"
+    if batch_id and source_term_iri:
+        return f"LEDGER::{batch_id}::{source_term_iri}"
+    if source_term_iri and canonical_term_iri:
+        return f"LEDGER::{source_term_iri}::{canonical_term_iri}"
     if source_term_iri:
         return f"LEDGER::{source_term_iri}"
     return ""
@@ -161,7 +183,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
         """
         PRAGMA foreign_keys = ON;
 
+        DROP TABLE IF EXISTS pair_alignment_candidates;
+        DROP TABLE IF EXISTS pair_alignments;
+        DROP TABLE IF EXISTS reconciled_mappings;
+        DROP TABLE IF EXISTS reconciled_canonical_groups;
+
         CREATE TABLE IF NOT EXISTS pair_alignment_candidates (
+            batch_id TEXT,
+            pivot_source TEXT,
+            target_id TEXT,
+            target_backend TEXT,
             alignment_id TEXT PRIMARY KEY,
             left_source TEXT,
             left_term_iri TEXT,
@@ -188,6 +219,10 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS pair_alignments (
+            batch_id TEXT,
+            pivot_source TEXT,
+            target_id TEXT,
+            target_backend TEXT,
             alignment_id TEXT PRIMARY KEY,
             left_source TEXT,
             left_term_iri TEXT,
@@ -216,6 +251,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS reconciled_mappings (
             mapping_id TEXT PRIMARY KEY,
             alignment_id TEXT,
+            batch_id TEXT,
+            pivot_source TEXT,
+            target_id TEXT,
+            target_backend TEXT,
+            mapping_origin TEXT,
             source_term_source TEXT,
             source_term_iri TEXT,
             source_term_label TEXT,
@@ -245,6 +285,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON pair_alignments(status);
         CREATE INDEX IF NOT EXISTS idx_pair_alignments_canonical
             ON pair_alignments(canonical_term_iri);
+        CREATE INDEX IF NOT EXISTS idx_pair_alignments_left
+            ON pair_alignments(left_term_iri);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_reconciled_source_canonical
             ON reconciled_mappings(source_term_iri, canonical_term_iri);
         """
@@ -285,8 +327,20 @@ def insert_pair_rows(
                 values.append(to_float_or_none(row.get(col, "")))
             elif col == "alignment_id":
                 values.append(stable_alignment_id(row))
+            elif col == "batch_id":
+                values.append(clean(row.get("batch_id", "")))
+            elif col == "pivot_source":
+                values.append(clean(row.get("pivot_source", "")))
+            elif col == "target_id":
+                values.append(clean(row.get("target_id", "")))
+            elif col == "target_backend":
+                values.append(clean(row.get("target_backend", "")))
             elif col == "left_source":
-                values.append(clean(row.get("left_source", "")) or clean(row.get("source_term_source", "")))
+                values.append(normalize_source(row.get("left_source", "")) or normalize_source(row.get("source_term_source", "")))
+            elif col == "right_source":
+                values.append(normalize_source(row.get("right_source", "")))
+            elif col == "canonical_term_source":
+                values.append(normalize_source(row.get("canonical_term_source", "")))
             elif col == "left_term_iri":
                 values.append(clean(row.get("left_term_iri", "")) or clean(row.get("source_term_iri", "")))
             elif col == "left_label":
@@ -303,6 +357,11 @@ def append_source_mapping(
     seen_keys: set[tuple[str, str]],
     *,
     alignment_id: str,
+    batch_id: str,
+    pivot_source: str,
+    target_id: str,
+    target_backend: str,
+    mapping_origin: str,
     source_term_source: str,
     source_term_iri: str,
     source_term_label: str,
@@ -332,6 +391,11 @@ def append_source_mapping(
         {
             "mapping_id": f"REC_{len(out_rows) + 1:04d}",
             "alignment_id": alignment_id,
+            "batch_id": batch_id,
+            "pivot_source": pivot_source,
+            "target_id": target_id,
+            "target_backend": target_backend,
+            "mapping_origin": mapping_origin,
             "source_term_source": source_term_source,
             "source_term_iri": source_term_iri,
             "source_term_label": source_term_label,
@@ -350,19 +414,49 @@ def append_source_mapping(
     )
 
 
+def is_equivalence_relation(value: str) -> bool:
+    """Return True for relation values that safely support derived equivalence."""
+    normalized = clean(value).lower()
+    return normalized in {
+        "exact",
+        "owl:equivalentclass",
+        "owl:equivalentproperty",
+        "owl:sameas",
+        "skos:exactmatch",
+    }
+
+
+def derived_relation_for_kind(kind: str) -> str:
+    """Choose the most specific derived equivalence relation for a term kind."""
+    normalized = clean(kind).lower()
+    if normalized == "class":
+        return "owl:equivalentClass"
+    if normalized == "property":
+        return "owl:equivalentProperty"
+    if normalized == "individual":
+        return "owl:sameAs"
+    return "skos:exactMatch"
+
+
 def build_reconciled_rows(
     curated_rows: list[dict[str, str]],
     status_filter: str,
 ) -> list[dict[str, str]]:
-    """Build source->canonical rows from curated pair alignment rows."""
+    """Build direct and derived source->canonical rows from curated batch rows."""
     out_rows: list[dict[str, str]] = []
     seen_keys: set[tuple[str, str]] = set()
+    approved_rows: list[dict[str, str]] = []
 
     for row in curated_rows:
         if clean(row.get("status", "")).lower() != status_filter.lower():
             continue
+        approved_rows.append(row)
 
         alignment_id = stable_alignment_id(row)
+        batch_id = clean(row.get("batch_id", ""))
+        pivot_source = clean(row.get("pivot_source", ""))
+        target_id = clean(row.get("target_id", ""))
+        target_backend = clean(row.get("target_backend", ""))
         relation = clean(row.get("relation", ""))
         suggestion_source = clean(row.get("suggestion_source", "")) or "approved_ledger"
         curator = clean(row.get("curator", ""))
@@ -371,12 +465,12 @@ def build_reconciled_rows(
         date_added = clean(row.get("date_added", "")) or date_reviewed
         notes = clean(row.get("notes", "")) or clean(row.get("curation_comment", ""))
 
-        left_source = clean(row.get("source_term_source", "")) or clean(row.get("left_source", ""))
+        left_source = normalize_source(row.get("source_term_source", "")) or normalize_source(row.get("left_source", ""))
         left_iri = clean(row.get("source_term_iri", "")) or clean(row.get("left_term_iri", ""))
         left_label = clean(row.get("source_term_label", "")) or clean(row.get("left_label", ""))
         canonical_iri = clean(row.get("canonical_term_iri", ""))
         canonical_label = clean(row.get("canonical_term_label", ""))
-        canonical_source = clean(row.get("canonical_term_source", ""))
+        canonical_source = normalize_source(row.get("canonical_term_source", ""))
         if not (canonical_iri and canonical_label and canonical_source):
             continue
 
@@ -384,6 +478,11 @@ def build_reconciled_rows(
             out_rows,
             seen_keys,
             alignment_id=alignment_id,
+            batch_id=batch_id,
+            pivot_source=pivot_source,
+            target_id=target_id,
+            target_backend=target_backend,
+            mapping_origin="direct",
             source_term_source=left_source,
             source_term_iri=left_iri,
             source_term_label=left_label,
@@ -398,6 +497,83 @@ def build_reconciled_rows(
             date_reviewed=date_reviewed,
             notes=notes,
         )
+
+    by_left_term: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in approved_rows:
+        if not is_equivalence_relation(row.get("relation", "")):
+            continue
+        canonical_iri = clean(row.get("canonical_term_iri", ""))
+        canonical_source = clean(row.get("canonical_term_source", ""))
+        if not canonical_iri or not canonical_source:
+            continue
+        key = (
+            clean(row.get("source_term_iri", "")) or clean(row.get("left_term_iri", "")),
+            normalize_source(row.get("pivot_source", "")) or normalize_source(row.get("source_term_source", "")),
+        )
+        by_left_term.setdefault(key, []).append(row)
+
+    for (_, _), rows_for_left in by_left_term.items():
+        local_rows = [
+            row
+            for row in rows_for_left
+            if clean(row.get("target_backend", "")) == "source"
+            and clean(row.get("canonical_term_iri", ""))
+            and clean(row.get("canonical_term_iri", "")) != clean(row.get("source_term_iri", ""))
+        ]
+        other_targets = [
+            row
+            for row in rows_for_left
+            if clean(row.get("canonical_term_iri", ""))
+            and clean(row.get("canonical_term_iri", "")) != clean(row.get("source_term_iri", ""))
+        ]
+        for local_row in local_rows:
+            source_iri = clean(local_row.get("canonical_term_iri", ""))
+            source_label = clean(local_row.get("canonical_term_label", ""))
+            source_source = normalize_source(local_row.get("canonical_term_source", ""))
+            source_kind = clean(local_row.get("canonical_term_kind", "")) or clean(local_row.get("source_term_kind", ""))
+            for target_row in other_targets:
+                target_iri = clean(target_row.get("canonical_term_iri", ""))
+                if not target_iri or target_iri == source_iri:
+                    continue
+                target_label = clean(target_row.get("canonical_term_label", ""))
+                target_source = normalize_source(target_row.get("canonical_term_source", ""))
+                derived_alignment_id = (
+                    f"DERIVED::{clean(local_row.get('batch_id', ''))}::{source_iri}::{target_iri}"
+                )
+                support_ids = " | ".join(
+                    sorted(
+                        {
+                            stable_alignment_id(local_row),
+                            stable_alignment_id(target_row),
+                        }
+                    )
+                )
+                append_source_mapping(
+                    out_rows,
+                    seen_keys,
+                    alignment_id=derived_alignment_id,
+                    batch_id=clean(local_row.get("batch_id", "")),
+                    pivot_source=clean(local_row.get("pivot_source", "")),
+                    target_id=clean(local_row.get("target_id", "")),
+                    target_backend=clean(local_row.get("target_backend", "")),
+                    mapping_origin="derived",
+                    source_term_source=source_source,
+                    source_term_iri=source_iri,
+                    source_term_label=source_label,
+                    canonical_term_iri=target_iri,
+                    canonical_term_label=target_label,
+                    canonical_term_source=target_source,
+                    relation=derived_relation_for_kind(source_kind),
+                    suggestion_source="derived_via_pivot",
+                    curator=clean(local_row.get("curator", "")),
+                    reviewer=clean(local_row.get("reviewer", "")),
+                    date_added=clean(local_row.get("date_added", "")) or clean(local_row.get("date_reviewed", "")),
+                    date_reviewed=clean(target_row.get("date_reviewed", "")) or clean(local_row.get("date_reviewed", "")),
+                    notes=(
+                        f"Derived via pivot {clean(local_row.get('pivot_source', ''))}: "
+                        f"{support_ids}"
+                    ),
+                )
 
     return out_rows
 

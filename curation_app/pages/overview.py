@@ -5,7 +5,16 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from curation_app.context import enabled_source_ids, load_manifest, source_context, source_ids
+from curation_app.context import (
+    batch_context,
+    batch_ids,
+    enabled_batch_ids,
+    enabled_source_ids,
+    load_batch_manifest,
+    load_manifest,
+    source_context,
+    source_ids,
+)
 from curation_app.helpers import read_tsv, read_curators, render_clickable_dataframe, to_relpath
 
 STATE_PAGE = "active_page"
@@ -127,6 +136,46 @@ def _curator_progress_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _batch_metrics_df() -> pd.DataFrame:
+    manifest_df = load_manifest()
+    batch_df = load_batch_manifest()
+    ids = enabled_batch_ids(batch_df) or batch_ids(batch_df)
+    rows: list[dict[str, object]] = []
+    for batch_id in ids:
+        ctx = batch_context(batch_id, batch_df, manifest_df)
+        review_df = read_tsv(ctx.review_tsv)
+        queue_df = read_tsv(ctx.queue_tsv)
+        review_rows = len(review_df) if ctx.review_tsv.is_file() else 0
+        queue_rows = len(queue_df) if ctx.queue_tsv.is_file() else 0
+        reviewed_terms = 0
+        needs_review_terms = 0
+        if review_rows > 0 and "source_term_iri" in review_df.columns:
+            reviewed_terms = int(review_df["source_term_iri"].astype(str).str.strip().ne("").sum())
+        if queue_rows > 0 and {"left_term_iri", "status"}.issubset(queue_df.columns):
+            needs_review_terms = int(
+                queue_df.loc[queue_df["status"].astype(str) == "needs_review", "left_term_iri"]
+                .astype(str)
+                .str.strip()
+                .ne("")
+                .sum()
+            )
+        rows.append(
+            {
+                "Batch": ctx.batch_id,
+                "Pivot": ctx.pivot_source.upper(),
+                "Target": ctx.target_label,
+                "Backend": ctx.target_backend,
+                "Review rows": review_rows,
+                "Queue rows": queue_rows,
+                "Reviewed rows": reviewed_terms,
+                "Needs review rows": needs_review_terms,
+                "Review file": to_relpath(ctx.review_tsv),
+                "Local queue": to_relpath(ctx.queue_tsv),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def render() -> None:
     st.title("Schema Alignment")
     st.write(
@@ -148,6 +197,13 @@ def render() -> None:
             st.write(f"**{source}**")
             st.progress(pct, text=f"{curated}/{total} source term(s) approved in shared ledger")
 
+    st.subheader("Alignment batches")
+    batch_metrics_df = _batch_metrics_df()
+    if batch_metrics_df.empty:
+        st.info("No alignment batches configured yet.")
+    else:
+        render_clickable_dataframe(batch_metrics_df, use_container_width=True, hide_index=True)
+
     st.subheader("Curator progress")
     curator_df = _curator_progress_df()
     if curator_df.empty:
@@ -158,12 +214,13 @@ def render() -> None:
     st.subheader("Recommended flow")
     st.write("1. **Fetch schemas and ontologies**: maintain source manifest, download TTLs, and browse OLS catalog.")
     st.write("2. **Extract terms**: parse local TTL into term TSV with labels and metadata.")
-    st.write("3. **Generate candidates**: build left-vs-right or left-vs-OLS candidate matches.")
-    st.write("4. **Add terms**: create missing source classes/properties and seed mapping candidates.")
-    st.write("5. **Curate candidates**: validate one or more matches (or keep left term) for each left concept.")
-    st.write("6. **Review and export**: filter curated dataset and export updated source TTL.")
-    st.write("7. **View schema**: inspect ontology documentation before/after curation with pyLODE.")
-    st.write("8. **Inspect SQLite**: run table previews and SQL checks on auto-synced reconciliation tables.")
+    st.write("3. **Select alignment batch**: choose the pivot-left batch that defines the current right-side target.")
+    st.write("4. **Generate candidates**: build pivot-vs-batch candidate matches.")
+    st.write("5. **Add terms**: create missing pivot classes/properties and seed batch-specific mapping candidates.")
+    st.write("6. **Curate candidates**: validate one or more matches (or keep left term) for each pivot concept.")
+    st.write("7. **Review and export**: filter one batch ledger and export a batch-specific updated pivot TTL.")
+    st.write("8. **View schema**: inspect ontology documentation before/after curation with pyLODE.")
+    st.write("9. **Inspect SQLite**: run table previews and SQL checks on auto-synced reconciliation tables.")
 
     st.subheader("Open modules")
     c1, c2 = st.columns(2)

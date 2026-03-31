@@ -9,13 +9,13 @@ from curation_app.config import (
     DEFAULT_RECONCILED_FILE,
     DEFAULT_SQLITE_DB,
 )
-from curation_app.context import active_source_context
+from curation_app.context import active_alignment_context
 from curation_app.helpers import render_file_download, render_table_preview, run_python_script, show_command_result, to_relpath
 
 
 def render() -> None:
     st.title("Step 6: Sync SQLite + Export Reconciled Files")
-    ctx = active_source_context()
+    ctx = active_alignment_context()
     default_review = ctx.review_tsv if ctx else None
 
     db_path = st.text_input("SQLite DB", value=to_relpath(DEFAULT_SQLITE_DB))
@@ -30,7 +30,7 @@ def render() -> None:
     status_filter = st.text_input("Status to export", value="approved")
     reconciled_output = st.text_input("Reconciled mappings TSV", value=to_relpath(DEFAULT_RECONCILED_FILE))
     grouped_output = st.text_input("Canonical groups TSV", value=to_relpath(DEFAULT_GROUPS_FILE))
-    st.caption("Recommended setup: point both TSV fields to the same versioned per-schema review ledger.")
+    st.caption("Recommended setup: point both TSV fields to the same versioned per-batch review ledger.")
 
     if st.button("Run sync", type="primary"):
         args = [
