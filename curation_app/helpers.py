@@ -22,6 +22,10 @@ from curation_app.config import DEFAULT_CURATORS_FILE, ROOT_DIR
 FINAL_REVIEW_STATUSES = {"approved"}
 ORCID_RECORD_API = "https://pub.orcid.org/v3.0"
 LEDGER_COLUMNS = [
+    "batch_id",
+    "pivot_source",
+    "target_id",
+    "target_backend",
     "source_term_source",
     "source_term_iri",
     "source_term_label",
@@ -59,6 +63,11 @@ def to_path(value: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (ROOT_DIR / path).resolve()
+
+
+def normalize_source_value(value: object) -> str:
+    """Normalize ontology/source identifiers to lowercase text."""
+    return str(value or "").strip().lower()
 
 
 def to_relpath(value: str | Path) -> str:
@@ -336,8 +345,10 @@ def should_track_review_row(row: dict[str, object] | pd.Series) -> bool:
 
 
 def ledger_identity(row: dict[str, object] | pd.Series) -> str:
-    """Use source term IRI as the shared-ledger identity."""
-    return str((row.get("source_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    """Use (source term IRI, canonical term IRI) as the shared-ledger identity."""
+    source_iri = str((row.get("source_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    canonical_iri = str((row.get("canonical_term_iri", "") if hasattr(row, "get") else "") or "").strip()
+    return f"{source_iri}\t{canonical_iri}"
 
 
 def project_review_row(row: dict[str, object] | pd.Series) -> dict[str, str]:
@@ -359,15 +370,21 @@ def project_review_row(row: dict[str, object] | pd.Series) -> dict[str, str]:
             canonical_kind = right_kind
 
     return {
-        "source_term_source": str((row.get("left_source", "") if hasattr(row, "get") else "") or "").strip(),
+        "batch_id": str((row.get("batch_id", "") if hasattr(row, "get") else "") or "").strip(),
+        "pivot_source": str((row.get("pivot_source", "") if hasattr(row, "get") else "") or "").strip(),
+        "target_id": str((row.get("target_id", "") if hasattr(row, "get") else "") or "").strip(),
+        "target_backend": str((row.get("target_backend", "") if hasattr(row, "get") else "") or "").strip(),
+        "source_term_source": normalize_source_value(
+            (row.get("left_source", "") if hasattr(row, "get") else "") or ""
+        ),
         "source_term_iri": str((row.get("left_term_iri", "") if hasattr(row, "get") else "") or "").strip(),
         "source_term_label": str((row.get("left_label", "") if hasattr(row, "get") else "") or "").strip(),
         "source_term_kind": left_kind,
         "canonical_term_iri": str((row.get("canonical_term_iri", "") if hasattr(row, "get") else "") or "").strip(),
         "canonical_term_label": str((row.get("canonical_term_label", "") if hasattr(row, "get") else "") or "").strip(),
-        "canonical_term_source": str(
+        "canonical_term_source": normalize_source_value(
             (row.get("canonical_term_source", "") if hasattr(row, "get") else "") or ""
-        ).strip(),
+        ),
         "canonical_term_kind": canonical_kind,
         "relation": str((row.get("relation", "") if hasattr(row, "get") else "") or "").strip(),
         "status": str((row.get("status", "") if hasattr(row, "get") else "") or "").strip(),
@@ -387,7 +404,12 @@ def sync_review_ledger(
     queue_df: pd.DataFrame,
     touched_source_iris: set[str] | None = None,
 ) -> pd.DataFrame:
-    """Upsert finalized rows from the local queue into the versioned review ledger."""
+    """Append new finalized rows from the local queue into the versioned review ledger.
+
+    Existing approved ledger rows are preserved as-is so normal curation of
+    `needs_review` candidates cannot silently overwrite prior review provenance
+    for the same (source_term_iri, canonical_term_iri) pair.
+    """
     merged_cols = list(LEDGER_COLUMNS)
     if review_df.empty:
         ledger = pd.DataFrame(columns=merged_cols)
@@ -423,10 +445,6 @@ def sync_review_ledger(
             ledger = pd.concat([ledger, pd.DataFrame([row_values], columns=merged_cols)], ignore_index=True)
             new_idx = int(ledger.index[-1])
             pair_to_idx[pair_key] = new_idx
-        else:
-            for col, value in row_values.items():
-                ledger.at[existing_idx, col] = value
-            pair_to_idx[pair_key] = existing_idx
 
     ledger = ledger.reindex(columns=merged_cols, fill_value="")
     if not ledger.empty:

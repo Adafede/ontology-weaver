@@ -1,0 +1,4 @@
+batch_id	pivot_source	target_id	target_label	target_backend	enabled	description
+emi_ols	emi		OLS candidates	ols	1	EMI aligned against OLS ontology candidates.
+emi_enpkg	emi	enpkg	ENPKG	source	1	EMI aligned against downloaded schema ENPKG.
+emi_test	emi	test	Test schema	source	0	Optional test batch for EMI against the test schema.

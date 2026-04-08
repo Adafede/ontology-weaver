@@ -16,9 +16,10 @@ from rdflib import Graph, URIRef
 from rdflib.namespace import OWL, RDF, RDFS, SKOS
 
 from curation_app.config import DEFAULT_OLS_ONTOLOGIES_FILE
-from curation_app.context import active_source_context
+from curation_app.context import active_alignment_context, stamp_batch_metadata, stamp_batch_record
 from curation_app.helpers import (
     dataframe_to_tsv_bytes,
+    normalize_source_value,
     normalize_notes_for_approval,
     read_tsv,
     render_clickable_dataframe,
@@ -31,6 +32,10 @@ from curation_app.helpers import (
 
 
 REQUIRED_COLUMNS = [
+    "batch_id",
+    "pivot_source",
+    "target_id",
+    "target_backend",
     "alignment_id",
     "left_source",
     "left_term_iri",
@@ -165,6 +170,7 @@ STATE_CURATOR_NAME = "active_curator_name"
 STATE_GROUP_MODE = "group_session_active"
 STATE_SESSION_CURATORS = "group_session_curators"  # list[tuple[str, str]] (orcid, name)
 STATE_REVIEW_SYNC_IRIS = "curation_review_sync_iris"
+STATE_PENDING_APPROVALS = "curation_pending_approvals"
 
 
 def _prepare_review_display_df(review_df: pd.DataFrame) -> pd.DataFrame:
@@ -243,9 +249,9 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _load_df(path_text: str) -> pd.DataFrame:
+def _load_df(path_text: str, ctx) -> pd.DataFrame:
     df = read_tsv(path_text)
-    return _ensure_columns(df)
+    return stamp_batch_metadata(_ensure_columns(df), ctx)
 
 
 def _file_mtime(path_text: str) -> float | None:
@@ -257,8 +263,14 @@ def _file_mtime(path_text: str) -> float | None:
 
 def _save_queue_and_sync_review(queue_file: str, review_file: str) -> None:
     queue_df = st.session_state[STATE_DF]
+    ctx = active_alignment_context()
+    if ctx is not None:
+        queue_df = stamp_batch_metadata(queue_df, ctx)
+        st.session_state[STATE_DF] = queue_df
     write_tsv(queue_df, queue_file)
     review_df = read_tsv(review_file)
+    if ctx is not None:
+        review_df = stamp_batch_metadata(review_df, ctx)
     touched_source_iris = set(str(x or "").strip() for x in st.session_state.get(STATE_REVIEW_SYNC_IRIS, set()))
     synced_review_df = sync_review_ledger(review_df, queue_df, touched_source_iris=touched_source_iris)
     write_tsv(synced_review_df, review_file)
@@ -306,7 +318,7 @@ def _apply_approve_left(df: pd.DataFrame, idx: int, reviewer: str, relation: str
     df.at[idx, "canonical_from"] = "left"
     df.at[idx, "canonical_term_iri"] = df.at[idx, "left_term_iri"]
     df.at[idx, "canonical_term_label"] = df.at[idx, "left_label"]
-    df.at[idx, "canonical_term_source"] = df.at[idx, "left_source"]
+    df.at[idx, "canonical_term_source"] = normalize_source_value(df.at[idx, "left_source"])
     df.at[idx, "canonical_term_kind"] = df.at[idx, "left_term_kind"]
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -319,7 +331,7 @@ def _apply_approve_right(df: pd.DataFrame, idx: int, reviewer: str, relation: st
     df.at[idx, "canonical_from"] = "right"
     df.at[idx, "canonical_term_iri"] = df.at[idx, "right_term_iri"]
     df.at[idx, "canonical_term_label"] = df.at[idx, "right_label"]
-    df.at[idx, "canonical_term_source"] = df.at[idx, "right_source"]
+    df.at[idx, "canonical_term_source"] = normalize_source_value(df.at[idx, "right_source"])
     df.at[idx, "canonical_term_kind"] = df.at[idx, "right_term_kind"]
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -345,7 +357,7 @@ def _apply_approve_manual(
     df.at[idx, "canonical_from"] = "manual"
     df.at[idx, "canonical_term_iri"] = manual_iri.strip()
     df.at[idx, "canonical_term_label"] = manual_label.strip()
-    df.at[idx, "canonical_term_source"] = manual_source.strip()
+    df.at[idx, "canonical_term_source"] = normalize_source_value(manual_source)
     df.at[idx, "canonical_term_kind"] = manual_kind.strip()
     df.at[idx, "relation"] = relation
     df.at[idx, "suggestion_source"] = "manual_curated"
@@ -1524,15 +1536,16 @@ def render() -> None:
         unsafe_allow_html=True,
     )
 
-    ctx = active_source_context()
+    ctx = active_alignment_context()
     if ctx is None:
-        st.warning("No source slug available. Configure sources in Download External Sources first.")
+        st.warning("No alignment batch found. Configure registry/alignment_batches.tsv first.")
         return
 
     queue_file = to_relpath(ctx.queue_tsv)
     review_file = to_relpath(ctx.review_tsv)
-    st.caption(f"Local queue: `{queue_file}`")
-    st.caption(f"Review ledger: `{review_file}`")
+    st.caption(f"Active batch: `{ctx.batch_label}`")
+    st.caption(f"Batch queue: `{queue_file}`")
+    st.caption(f"Batch review ledger: `{review_file}`")
     active_curator = str(st.session_state.get(STATE_CURATOR, "") or "").strip()
     active_curator_name = str(st.session_state.get(STATE_CURATOR_NAME, "") or "").strip()
     if active_curator and active_curator_name:
@@ -1547,16 +1560,19 @@ def render() -> None:
         or STATE_DF not in st.session_state
     ):
         st.session_state[STATE_PATH] = queue_file
-        st.session_state[STATE_DF] = _load_df(queue_file)
+        st.session_state[STATE_DF] = _load_df(queue_file, ctx)
         st.session_state[STATE_DIRTY] = False
         st.session_state[STATE_MTIME] = _file_mtime(queue_file)
         st.session_state[STATE_KEPT_LEFT_TERMS] = []
         st.session_state[STATE_REVIEW_SYNC_IRIS] = set()
+        st.session_state[STATE_PENDING_APPROVALS] = {}
 
     if STATE_KEPT_LEFT_TERMS not in st.session_state:
         st.session_state[STATE_KEPT_LEFT_TERMS] = []
     if STATE_REVIEW_SYNC_IRIS not in st.session_state:
         st.session_state[STATE_REVIEW_SYNC_IRIS] = set()
+    if STATE_PENDING_APPROVALS not in st.session_state:
+        st.session_state[STATE_PENDING_APPROVALS] = {}
 
     current_mtime = _file_mtime(queue_file)
     loaded_mtime = st.session_state.get(STATE_MTIME)
@@ -1567,17 +1583,20 @@ def render() -> None:
                 "Use 'Reload from disk' to refresh."
             )
         else:
-            st.session_state[STATE_DF] = _load_df(queue_file)
+            st.session_state[STATE_DF] = _load_df(queue_file, ctx)
             st.session_state[STATE_MTIME] = current_mtime
+            st.session_state[STATE_PENDING_APPROVALS] = {}
+            st.session_state[STATE_SELECTED_ALIGNMENT] = ""
             st.info("Reloaded latest local queue from disk.")
 
     col_reload, col_save = st.columns(2)
     with col_reload:
         if st.button("Reload from disk"):
-            st.session_state[STATE_DF] = _load_df(queue_file)
+            st.session_state[STATE_DF] = _load_df(queue_file, ctx)
             st.session_state[STATE_DIRTY] = False
             st.session_state[STATE_MTIME] = _file_mtime(queue_file)
             st.session_state[STATE_REVIEW_SYNC_IRIS] = set()
+            st.session_state[STATE_PENDING_APPROVALS] = {}
     with col_save:
         if st.button("Save local queue", type="primary"):
             _save_queue_and_sync_review(queue_file, review_file)
@@ -1599,10 +1618,11 @@ def render() -> None:
         else:
             st.info(f"{catalog_msg} Mapping relation selection remains optional on this page.")
 
-    df = st.session_state[STATE_DF]
-    review_df = read_tsv(review_file)
+    df = stamp_batch_metadata(st.session_state[STATE_DF], ctx)
+    st.session_state[STATE_DF] = df
+    review_df = stamp_batch_metadata(read_tsv(review_file), ctx)
     if df.empty and not to_path(queue_file).is_file():
-        st.warning("No local queue found for this source. Please run Generate Pairwise Candidates first.")
+        st.warning("No local queue found for this batch. Please run Generate Pairwise Candidates first.")
         return
 
     term_groups = (
@@ -1661,13 +1681,36 @@ def render() -> None:
         options=available_statuses,
         default=default_statuses,
     )
+    include_shared_approved = st.checkbox(
+        "Include terms already approved in shared ledger",
+        value=False,
+        help=(
+            "Off by default so normal curation focuses on unresolved terms. "
+            "Enable only when you intentionally want to revisit already approved shared decisions."
+        ),
+    )
     search_text = st.text_input("Search (left/right labels, logs, curation comments)", value="")
 
     filtered = _filtered_df(df, selected_statuses, search_text)
-    st.caption(f"Filtered rows: {len(filtered)}")
+    reviewable_filtered = filtered.copy()
+    hidden_shared_rows = 0
+    if not include_shared_approved and not review_df.empty and "source_term_iri" in review_df.columns:
+        approved_shared_iris = {
+            str(value or "").strip()
+            for value in review_df["source_term_iri"].astype(str).tolist()
+            if str(value or "").strip()
+        }
+        if approved_shared_iris:
+            mask = reviewable_filtered["left_term_iri"].astype(str).isin(approved_shared_iris)
+            hidden_shared_rows = int(mask.sum())
+            reviewable_filtered = reviewable_filtered.loc[~mask].copy()
+    if hidden_shared_rows:
+        st.caption(f"Filtered rows: {len(filtered)} | hidden because already approved in shared ledger: {hidden_shared_rows}")
+    else:
+        st.caption(f"Filtered rows: {len(filtered)}")
 
     left_terms_df = (
-        filtered[
+        reviewable_filtered[
             [
                 "left_source",
                 "left_term_iri",
@@ -1709,38 +1752,29 @@ def render() -> None:
         st.session_state[STATE_LEFT_TERM_INDEX] = selected_idx
         left_source, left_iri, left_label = selected_left
         left_term_key = f"{left_source}|{left_iri}"
+        pending_approvals = st.session_state.get(STATE_PENDING_APPROVALS, {})
         shared_left_rows = pd.DataFrame()
         if not review_df.empty and "source_term_iri" in review_df.columns:
             shared_left_rows = review_df[review_df["source_term_iri"].astype(str) == str(left_iri)].copy()
         if not shared_left_rows.empty:
-            shared_left_rows = shared_left_rows.sort_values(
-                by="date_reviewed",
-                ascending=False,
-                na_position="last",
-            )
-            approved_row = shared_left_rows.iloc[0]
-            canonical_label = str(approved_row.get("canonical_term_label", "") or "").strip()
-            canonical_source = str(approved_row.get("canonical_term_source", "") or "").strip()
-            reviewer_name = str(approved_row.get("reviewer_name", "") or "").strip()
-            reviewer_orcid = str(approved_row.get("reviewer", "") or "").strip()
-            date_reviewed = str(approved_row.get("date_reviewed", "") or "").strip()
-            relation = str(approved_row.get("relation", "") or "").strip()
-            summary_bits = [f"Approved shared decision: `{canonical_label}`"]
-            if canonical_source:
-                summary_bits.append(f"source `{canonical_source}`")
-            if relation:
-                summary_bits.append(f"relation `{relation}`")
-            if reviewer_name or reviewer_orcid:
-                reviewer_text = reviewer_name or reviewer_orcid
-                if reviewer_name and reviewer_orcid:
-                    reviewer_text = f"{reviewer_name} ({reviewer_orcid})"
-                summary_bits.append(f"reviewed by {reviewer_text}")
-            if date_reviewed:
-                summary_bits.append(f"on `{date_reviewed}`")
-            st.info(" | ".join(summary_bits))
-            comment_text = str(approved_row.get("curation_comment", "") or "").strip()
-            if comment_text:
-                st.caption(f"Shared curation comment: {comment_text}")
+            shared_left_rows = shared_left_rows.sort_values(by="date_reviewed", ascending=False, na_position="last")
+            st.info(f"**{len(shared_left_rows)} shared approved mapping(s)** for this term in the review ledger:")
+            for _, approved_row in shared_left_rows.iterrows():
+                canonical_label = str(approved_row.get("canonical_term_label", "") or "").strip()
+                canonical_source = str(approved_row.get("canonical_term_source", "") or "").strip()
+                relation = str(approved_row.get("relation", "") or "").strip()
+                reviewer_name = str(approved_row.get("reviewer_name", "") or "").strip()
+                date_reviewed = str(approved_row.get("date_reviewed", "") or "").strip()
+                summary_bits = [f"`{canonical_label or '(no label)'}`"]
+                if canonical_source:
+                    summary_bits.append(f"from `{canonical_source}`")
+                if relation:
+                    summary_bits.append(f"via `{relation}`")
+                if reviewer_name:
+                    summary_bits.append(f"by {reviewer_name}")
+                if date_reviewed:
+                    summary_bits.append(f"on `{date_reviewed[:10]}`")
+                st.caption(" | ".join(summary_bits))
         left_row_series = left_terms_df[
             (left_terms_df["left_source"] == left_source) & (left_terms_df["left_term_iri"] == left_iri)
         ].iloc[0]
@@ -1756,76 +1790,39 @@ def render() -> None:
         if not group_df.empty and (group_df["status"] == "rejected").all():
             left_is_kept = True
 
-        selected_alignment_id = None
-        row_idx = None
-        row = None
+        selected_alignment_id = str(st.session_state.get(STATE_SELECTED_ALIGNMENT, ""))
         if not group_df.empty:
-            selected_alignment_id = str(st.session_state.get(STATE_SELECTED_ALIGNMENT, ""))
             available_alignment_ids = group_df["alignment_id"].astype(str).tolist()
             if selected_alignment_id not in available_alignment_ids:
-                selected_alignment_id = ""
                 st.session_state[STATE_SELECTED_ALIGNMENT] = ""
-            if selected_alignment_id:
-                row_idx = int(df.index[df["alignment_id"] == selected_alignment_id][0])
-                row = df.loc[row_idx]
+                selected_alignment_id = ""
+        else:
+            selected_alignment_id = ""
+            st.session_state[STATE_SELECTED_ALIGNMENT] = ""
 
-        mapping_relation_selected = False
-        selected_mapping_relation = ""
         if relation_options:
-            default_relation = _normalize_mapping_relation(
-                row.get("relation", "") if row is not None else "", relation_allowed
-            )
-            relation_select_options = [MAPPING_RELATION_PLACEHOLDER] + relation_options
-            selected_mapping_relation = st.selectbox(
-                "Mapping relation (optional)",
-                options=relation_select_options,
-                index=(
-                    relation_select_options.index(default_relation)
-                    if default_relation in relation_select_options
-                    else 0
-                ),
-                key=f"mapping_relation_{left_term_key}",
-                help="Optional semantic relation metadata between source term and selected canonical term.",
-            )
-            mapping_relation_selected = selected_mapping_relation in relation_allowed
-            if mapping_relation_selected:
-                st.caption(
-                    _mapping_guidance_text(
-                        selected_mapping_relation,
-                        relation_definitions.get(selected_mapping_relation, ""),
-                    )
-                )
-                preview_labels = _derived_export_mapping_labels(
-                    selected_mapping_relation,
-                    left_row_series.get("left_term_kind", ""),
-                    row.get("right_term_kind", "") if row is not None else "",
-                )
-                if preview_labels:
-                    st.caption("Derived export mappings: " + ", ".join(f"`{x}`" for x in preview_labels))
-            else:
-                st.caption("Mapping relation is optional. Leave it empty to only supersede the source term with the selected canonical term.")
             with st.expander("Mapping guidance", expanded=False):
                 recommended_ordered = [
-                    rel for rel in MAPPING_GUIDANCE_ORDER if rel in relation_options and MAPPING_GUIDANCE.get(rel, {}).get("tier") != "advanced"
+                    rel
+                    for rel in MAPPING_GUIDANCE_ORDER
+                    if rel in relation_options and MAPPING_GUIDANCE.get(rel, {}).get("tier") != "advanced"
                 ]
                 advanced_ordered = [
-                    rel for rel in MAPPING_GUIDANCE_ORDER if rel in relation_options and MAPPING_GUIDANCE.get(rel, {}).get("tier") == "advanced"
+                    rel
+                    for rel in MAPPING_GUIDANCE_ORDER
+                    if rel in relation_options and MAPPING_GUIDANCE.get(rel, {}).get("tier") == "advanced"
                 ]
                 remaining = [rel for rel in relation_options if rel not in set(recommended_ordered + advanced_ordered)]
 
                 st.markdown("**Recommended first (ontology reconciliation)**")
                 for rel in recommended_ordered:
-                    st.markdown(
-                        f"- `{rel}`: {_mapping_guidance_text(rel, relation_definitions.get(rel, ''))}"
-                    )
+                    st.markdown(f"- `{rel}`: {_mapping_guidance_text(rel, relation_definitions.get(rel, ''))}")
                 if not recommended_ordered:
                     st.markdown("- No recommended relations available from local mapping ontologies.")
 
                 st.markdown("**Advanced / specific modeling cases**")
                 for rel in advanced_ordered:
-                    st.markdown(
-                        f"- `{rel}`: {_mapping_guidance_text(rel, relation_definitions.get(rel, ''))}"
-                    )
+                    st.markdown(f"- `{rel}`: {_mapping_guidance_text(rel, relation_definitions.get(rel, ''))}")
                 for rel in remaining:
                     st.markdown(f"- `{rel}`: {relation_definitions.get(rel, '')}")
         else:
@@ -1848,11 +1845,34 @@ def render() -> None:
                     ("Example", str(left_row_series.get("left_example", "") or "-")),
                 ],
             )
-            if st.button("Keep current term", key=f"keep_left_{left_term_key}"):
-                kept_left_terms.add(left_term_key)
+            relation_bound_pending = [
+                item
+                for item in pending_approvals.get(left_term_key, [])
+                if str(item.get("relation", "") or "").strip()
+            ]
+            relation_missing_pending = [
+                item
+                for item in pending_approvals.get(left_term_key, [])
+                if not str(item.get("relation", "") or "").strip()
+            ]
+            left_button_label = "Remove left selection" if left_is_kept else "Keep current term"
+            if st.button(left_button_label, key=f"keep_left_{left_term_key}"):
+                if left_is_kept:
+                    if relation_bound_pending:
+                        st.warning("Left term must stay selected while any queued right term has a relationship.")
+                    else:
+                        kept_left_terms.discard(left_term_key)
+                else:
+                    if relation_missing_pending:
+                        st.warning(
+                            "Selecting the left term also requires a relationship for every queued right term."
+                        )
+                    else:
+                        kept_left_terms.add(left_term_key)
                 st.session_state[STATE_KEPT_LEFT_TERMS] = sorted(kept_left_terms)
                 st.session_state[STATE_SELECTED_ALIGNMENT] = ""
-                st.rerun()
+                if not ((left_is_kept and relation_bound_pending) or ((not left_is_kept) and relation_missing_pending)):
+                    st.rerun()
         with right_col:
             st.markdown("**Matched terms**")
             if group_df.empty:
@@ -1860,21 +1880,25 @@ def render() -> None:
             else:
                 for _, right_row in group_df.iterrows():
                     current_alignment_id = str(right_row["alignment_id"])
-                    is_selected = current_alignment_id == selected_alignment_id
+                    pending_for_term = pending_approvals.get(left_term_key, [])
+                    pending_by_alignment = {item["alignment_id"]: item.get("relation", "") for item in pending_for_term}
+                    is_pending = current_alignment_id in pending_by_alignment
+                    is_recent = current_alignment_id == selected_alignment_id
                     is_kind_mismatch = _kind_mismatch(
                         left_row_series.get("left_term_kind", ""),
                         right_row.get("right_term_kind", ""),
                     )
-                    has_right_decision = bool(selected_alignment_id)
-                    if left_is_kept:
+                    if is_pending:
+                        card_state = True
+                    elif left_is_kept:
                         card_state = False
-                    elif has_right_decision:
-                        card_state = is_selected
                     else:
                         card_state = None
                     title = str(right_row["right_label"] or right_row["right_term_iri"] or "(no label)")
-                    if is_selected:
-                        title = f"{title} [selected]"
+                    if is_pending:
+                        title = f"{title} [queued]"
+                    elif is_recent:
+                        title = f"{title} [recent]"
                     _render_term_card(
                         side="right",
                         title=title,
@@ -1894,27 +1918,74 @@ def render() -> None:
                             ("Example", str(right_row["right_example"] or "-")),
                         ],
                     )
-                    select_col, delete_col = st.columns(2)
-                    if select_col.button(
-                        "Select this match",
-                        key=f"select_match_{current_alignment_id}",
-                    ):
-                        st.session_state[STATE_SELECTED_ALIGNMENT] = current_alignment_id
-                        kept_left_terms.discard(left_term_key)
-                        st.session_state[STATE_KEPT_LEFT_TERMS] = sorted(kept_left_terms)
-                        st.rerun()
-                    if delete_col.button(
-                        "Delete this match",
-                        key=f"delete_match_{current_alignment_id}",
-                    ):
-                        mask = df["alignment_id"].astype(str) == current_alignment_id
-                        if bool(mask.any()):
-                            st.session_state[STATE_DF] = df.loc[~mask].reset_index(drop=True)
-                            if st.session_state.get(STATE_SELECTED_ALIGNMENT) == current_alignment_id:
-                                st.session_state[STATE_SELECTED_ALIGNMENT] = ""
-                            st.session_state[STATE_DIRTY] = True
-                            st.success("Deleted candidate match.")
+                    cand_rel_key = f"cand_rel_{current_alignment_id}"
+                    if cand_rel_key not in st.session_state:
+                        preferred_relation = pending_by_alignment.get(
+                            current_alignment_id,
+                            _normalize_mapping_relation(str(right_row.get("relation", "") or ""), relation_allowed),
+                        )
+                        st.session_state[cand_rel_key] = preferred_relation
+
+                    if relation_options:
+                        relation_select_options = [MAPPING_RELATION_PLACEHOLDER] + relation_options
+                        chosen_relation = str(st.session_state.get(cand_rel_key, "") or "")
+                        relation_index = (
+                            relation_select_options.index(chosen_relation)
+                            if chosen_relation in relation_select_options
+                            else 0
+                        )
+                        chosen_relation = st.selectbox(
+                            "Relation",
+                            options=relation_select_options,
+                            index=relation_index,
+                            key=cand_rel_key,
+                            label_visibility="collapsed",
+                            help="Optional mapping relation for this specific candidate.",
+                            disabled=is_pending,
+                        )
+                        chosen_relation = chosen_relation if chosen_relation in relation_allowed else ""
+                    else:
+                        chosen_relation = ""
+
+                    action_col = st.columns([1])[0]
+                    relation_requires_left = bool(chosen_relation) and not left_is_kept
+                    left_with_right_requires_relation = left_is_kept and not bool(chosen_relation)
+                    right_only_allows_one = (not left_is_kept) and bool(pending_for_term)
+                    if is_pending:
+                        if action_col.button(
+                            "Unselect",
+                            key=f"unapprove_{current_alignment_id}",
+                            use_container_width=True,
+                        ):
+                            pending_for_term = [
+                                item for item in pending_for_term if item["alignment_id"] != current_alignment_id
+                            ]
+                            pending_approvals[left_term_key] = pending_for_term
+                            st.session_state[STATE_PENDING_APPROVALS] = pending_approvals
                             st.rerun()
+                    else:
+                        if action_col.button(
+                            "Select",
+                            key=f"approve_match_{current_alignment_id}",
+                            use_container_width=True,
+                            disabled=relation_requires_left or left_with_right_requires_relation or right_only_allows_one,
+                        ):
+                            pending_for_term = [
+                                item for item in pending_for_term if item["alignment_id"] != current_alignment_id
+                            ]
+                            pending_for_term.append(
+                                {"alignment_id": current_alignment_id, "relation": chosen_relation}
+                            )
+                            pending_approvals[left_term_key] = pending_for_term
+                            st.session_state[STATE_PENDING_APPROVALS] = pending_approvals
+                            st.session_state[STATE_SELECTED_ALIGNMENT] = current_alignment_id
+                            st.rerun()
+                        if relation_requires_left:
+                            st.caption("Select the left term as well if you want to assign a relationship.")
+                        elif left_with_right_requires_relation:
+                            st.caption("Select a relationship if you want to approve this right term with the left term.")
+                        elif right_only_allows_one:
+                            st.caption("Without the left term selected, you can queue only one right term.")
 
             st.markdown("**Add manual candidate**")
             manual_search_query_key = f"manual_candidate_search_query_{left_term_key}"
@@ -1963,8 +2034,6 @@ def render() -> None:
                     existing_alignment_id = str(df.loc[existing_mask].iloc[0]["alignment_id"])
                     st.warning("This candidate URL already exists for the selected left term.")
                     st.session_state[STATE_SELECTED_ALIGNMENT] = existing_alignment_id
-                    kept_left_terms.discard(left_term_key)
-                    st.session_state[STATE_KEPT_LEFT_TERMS] = sorted(kept_left_terms)
                     st.rerun()
 
                 resolved_ontology, search_hint = _lookup_ols_hit_by_iri(iri_clean)
@@ -1999,7 +2068,7 @@ def render() -> None:
                     right_kind=resolved_kind,
                 )
 
-                new_row = {col: "" for col in df.columns}
+                new_row = stamp_batch_record({col: "" for col in df.columns}, ctx)
                 new_row["alignment_id"] = _next_alignment_id(df)
                 new_row["left_source"] = left_source
                 new_row["left_term_iri"] = left_iri
@@ -2008,7 +2077,7 @@ def render() -> None:
                 new_row["left_comment"] = str(left_row_series.get("left_comment", "") or "")
                 new_row["left_example"] = str(left_row_series.get("left_example", "") or "")
                 new_row["left_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
-                new_row["right_source"] = metadata_ontology.upper()
+                new_row["right_source"] = normalize_source_value(metadata_ontology)
                 new_row["right_term_iri"] = iri_clean
                 new_row["right_label"] = right_label_value
                 new_row["right_definition"] = metadata["definition"]
@@ -2049,14 +2118,13 @@ def render() -> None:
                 if "normalized_right_label" in df.columns:
                     new_row["normalized_right_label"] = str(right_label_value).strip().lower()
 
+                stamped_row = stamp_batch_record(new_row, ctx)
                 st.session_state[STATE_DF] = pd.concat(
-                    [st.session_state[STATE_DF], pd.DataFrame([new_row], columns=df.columns)],
+                    [st.session_state[STATE_DF], pd.DataFrame([stamped_row], columns=df.columns)],
                     ignore_index=True,
                 )
                 st.session_state[STATE_DIRTY] = True
                 st.session_state[STATE_SELECTED_ALIGNMENT] = str(new_row["alignment_id"])
-                kept_left_terms.discard(left_term_key)
-                st.session_state[STATE_KEPT_LEFT_TERMS] = sorted(kept_left_terms)
                 st.success("Manual candidate added.")
                 st.rerun()
 
@@ -2201,16 +2269,33 @@ def render() -> None:
                     st.error("Ontology ID is required.")
                 else:
                     _add_manual_candidate_row(iri, ontology_id, source="manual")
-        decision_made = left_is_kept or (row is not None and row_idx is not None)
-        if row is not None:
-            selected_left_kind = left_row_series.get("left_term_kind", "")
-            selected_right_kind = row.get("right_term_kind", "")
-            if _kind_mismatch(selected_left_kind, selected_right_kind):
-                st.warning(
-                    "Kind mismatch: selected match is "
-                    f"`{_display_kind(selected_right_kind)}` while left term is "
-                    f"`{_display_kind(selected_left_kind)}`."
-                )
+        pending_for_term = st.session_state.get(STATE_PENDING_APPROVALS, {}).get(left_term_key, [])
+        if left_is_kept:
+            if pending_for_term:
+                st.caption("Current source term is selected to anchor the queued relationship mapping(s).")
+            else:
+                st.caption("Current source term is selected for approval.")
+        if pending_for_term:
+            st.markdown(f"**{len(pending_for_term)} mapping(s) queued for approval:**")
+            for pending_item in pending_for_term:
+                pending_alignment_id = pending_item["alignment_id"]
+                pending_relation = pending_item.get("relation", "") or "(no relation)"
+                pending_rows = group_df[group_df["alignment_id"].astype(str) == pending_alignment_id]
+                if not pending_rows.empty:
+                    pending_row = pending_rows.iloc[0]
+                    pending_label = str(
+                        pending_row.get("right_label")
+                        or pending_row.get("right_term_iri")
+                        or pending_alignment_id
+                    )
+                    pending_source = str(pending_row.get("right_source", "") or "")
+                    st.caption(f"→ `{pending_relation}` → **{pending_label}** ({pending_source})")
+                else:
+                    st.caption(f"→ `{pending_relation}` → alignment {pending_alignment_id}")
+        elif not left_is_kept:
+            st.info("Approve one or more candidate matches above, keep the current term, or combine both.")
+
+        decision_made = left_is_kept or bool(pending_for_term)
 
         st.markdown("**Curation comment**")
         curation_comment = st.text_area(
@@ -2227,110 +2312,101 @@ def render() -> None:
             disabled=not decision_made,
             use_container_width=True,
         ):
-            if left_is_kept:
-                mask = (df["left_source"] == left_source) & (df["left_term_iri"] == left_iri)
-                idxs = df.index[mask].tolist()
-                carrier_idx = idxs[0] if idxs else None
-                if carrier_idx is None:
-                    new_row = {col: "" for col in df.columns}
-                    new_row["alignment_id"] = _next_alignment_id(df)
-                    new_row["left_source"] = left_source
-                    new_row["left_term_iri"] = left_iri
-                    new_row["left_label"] = left_label
-                    new_row["left_definition"] = str(left_row_series.get("left_definition", "") or "")
-                    new_row["left_comment"] = str(left_row_series.get("left_comment", "") or "")
-                    new_row["left_example"] = str(left_row_series.get("left_example", "") or "")
-                    new_row["left_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
-                    new_row["status"] = "approved"
-                    new_row["canonical_from"] = "left"
-                    new_row["canonical_term_iri"] = left_iri
-                    new_row["canonical_term_label"] = left_label
-                    new_row["canonical_term_source"] = left_source
-                    new_row["canonical_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
-                    new_row["relation"] = ""
-                    new_row["suggestion_source"] = "manual_curated"
-                    new_row["curator"] = "auto"
-                    new_row["curator_name"] = ""
-                    new_row["reviewer"] = active_curator
-                    new_row["reviewer_name"] = active_curator_name
-                    new_row["date_added"] = utc_now_timestamp()
-                    new_row["date_reviewed"] = utc_now_timestamp()
-                    new_row["logs"] = "Kept current source term; recorded source term as canonical."
-                    new_row["curation_comment"] = curation_comment.strip()
-                    df = pd.concat([df, pd.DataFrame([new_row], columns=df.columns)], ignore_index=True)
-                    st.session_state[STATE_DF] = df
+            pending_approvals = st.session_state.get(STATE_PENDING_APPROVALS, {})
+            approved_ids = {
+                item["alignment_id"]: item.get("relation", "")
+                for item in pending_approvals.get(left_term_key, [])
+            }
+            if not left_is_kept and any(str(relation or "").strip() for relation in approved_ids.values()):
+                st.error("A queued right-term relationship requires the left term to be selected as well.")
+                st.stop()
+            if not left_is_kept and len(approved_ids) > 1:
+                st.error("Without the left term selected, only one right term can be validated.")
+                st.stop()
+            if left_is_kept and approved_ids and any(not str(relation or "").strip() for relation in approved_ids.values()):
+                st.error("When the left term and right term are both selected, each right-term mapping needs a relationship.")
+                st.stop()
+            mask = (df["left_source"] == left_source) & (df["left_term_iri"] == left_iri)
+            idxs = df.index[mask].tolist()
+
+            record_left_as_canonical = left_is_kept and not approved_ids
+            carrier_idx = None
+            if record_left_as_canonical:
+                candidate_carriers = [idx for idx in idxs if str(df.at[idx, "alignment_id"] or "") not in approved_ids]
+                carrier_idx = candidate_carriers[0] if candidate_carriers else None
+
+            for idx in idxs:
+                existing_logs = str(df.at[idx, "logs"] or "").strip()
+                alignment_id = str(df.at[idx, "alignment_id"] or "")
+                if record_left_as_canonical and idx == carrier_idx:
+                    df.at[idx, "status"] = "approved"
+                    df.at[idx, "canonical_from"] = "left"
+                    df.at[idx, "canonical_term_iri"] = df.at[idx, "left_term_iri"]
+                    df.at[idx, "canonical_term_label"] = df.at[idx, "left_label"]
+                    df.at[idx, "canonical_term_source"] = df.at[idx, "left_source"]
+                    df.at[idx, "canonical_term_kind"] = df.at[idx, "left_term_kind"]
+                    df.at[idx, "relation"] = ""
+                    df.at[idx, "suggestion_source"] = "manual_curated"
+                    log_entry = "Kept current source term; recorded source term as canonical."
+                elif alignment_id in approved_ids:
+                    df.at[idx, "status"] = "approved"
+                    df.at[idx, "canonical_from"] = "right"
+                    df.at[idx, "canonical_term_iri"] = df.at[idx, "right_term_iri"]
+                    df.at[idx, "canonical_term_label"] = df.at[idx, "right_label"]
+                    df.at[idx, "canonical_term_source"] = df.at[idx, "right_source"]
+                    df.at[idx, "canonical_term_kind"] = df.at[idx, "right_term_kind"]
+                    df.at[idx, "relation"] = approved_ids.get(alignment_id, "")
+                    df.at[idx, "suggestion_source"] = "manual_curated"
+                    log_entry = "Validated right-side match (multi-mapping)."
                 else:
-                    for idx in idxs:
-                        existing_logs = str(df.at[idx, "logs"] or "").strip()
-                        if idx == carrier_idx:
-                            df.at[idx, "status"] = "approved"
-                            df.at[idx, "canonical_from"] = "left"
-                            df.at[idx, "canonical_term_iri"] = df.at[idx, "left_term_iri"]
-                            df.at[idx, "canonical_term_label"] = df.at[idx, "left_label"]
-                            df.at[idx, "canonical_term_source"] = df.at[idx, "left_source"]
-                            df.at[idx, "canonical_term_kind"] = df.at[idx, "left_term_kind"]
-                            df.at[idx, "relation"] = ""
-                            df.at[idx, "suggestion_source"] = "manual_curated"
-                            log_entry = "Kept current source term; recorded source term as canonical."
-                        else:
-                            df.at[idx, "status"] = "rejected"
-                            df.at[idx, "canonical_from"] = ""
-                            df.at[idx, "canonical_term_iri"] = ""
-                            df.at[idx, "canonical_term_label"] = ""
-                            df.at[idx, "canonical_term_source"] = ""
-                            df.at[idx, "canonical_term_kind"] = ""
-                            df.at[idx, "relation"] = ""
-                            log_entry = "Not selected for this source term."
-                        df.at[idx, "logs"] = _append_log(existing_logs, log_entry)
-                        df.at[idx, "curation_comment"] = curation_comment.strip()
-                        df.at[idx, "date_reviewed"] = utc_now_timestamp()
-                        if active_curator:
-                            df.at[idx, "reviewer"] = active_curator
-                            df.at[idx, "reviewer_name"] = active_curator_name
+                    df.at[idx, "status"] = "rejected"
+                    df.at[idx, "canonical_from"] = ""
+                    df.at[idx, "canonical_term_iri"] = ""
+                    df.at[idx, "canonical_term_label"] = ""
+                    df.at[idx, "canonical_term_source"] = ""
+                    df.at[idx, "canonical_term_kind"] = ""
+                    df.at[idx, "relation"] = ""
+                    log_entry = "Not selected for this left term."
+                df.at[idx, "logs"] = _append_log(existing_logs, log_entry)
+                df.at[idx, "curation_comment"] = curation_comment.strip()
+                _set_review_fields(df, idx, active_curator)
 
-                st.session_state[STATE_DIRTY] = True
-                _mark_review_sync_iri(left_iri)
-                st.session_state[STATE_LEFT_TERM_INDEX] = min(selected_idx + 1, len(left_keys) - 1)
-                st.session_state[STATE_SELECTED_ALIGNMENT] = ""
-                st.rerun()
-            else:
-                mask = (df["left_source"] == left_source) & (df["left_term_iri"] == left_iri)
-                idxs = df.index[mask].tolist()
-                for idx in idxs:
-                    existing_logs = str(df.at[idx, "logs"] or "").strip()
-                    if idx == row_idx:
-                        df.at[idx, "status"] = "approved"
-                        df.at[idx, "canonical_from"] = "right"
-                        df.at[idx, "canonical_term_iri"] = df.at[idx, "right_term_iri"]
-                        df.at[idx, "canonical_term_label"] = df.at[idx, "right_label"]
-                        df.at[idx, "canonical_term_source"] = df.at[idx, "right_source"]
-                        df.at[idx, "canonical_term_kind"] = df.at[idx, "right_term_kind"]
-                        df.at[idx, "relation"] = selected_mapping_relation if mapping_relation_selected else ""
-                        df.at[idx, "suggestion_source"] = "manual_curated"
-                        log_entry = "Validated selected right-side match."
-                    else:
-                        df.at[idx, "status"] = "rejected"
-                        df.at[idx, "canonical_from"] = ""
-                        df.at[idx, "canonical_term_iri"] = ""
-                        df.at[idx, "canonical_term_label"] = ""
-                        df.at[idx, "canonical_term_source"] = ""
-                        df.at[idx, "canonical_term_kind"] = ""
-                        df.at[idx, "relation"] = ""
-                        log_entry = "Not selected for this left term."
-                    df.at[idx, "logs"] = _append_log(existing_logs, log_entry)
-                    df.at[idx, "curation_comment"] = curation_comment.strip()
-                    df.at[idx, "date_reviewed"] = utc_now_timestamp()
-                    if active_curator:
-                        df.at[idx, "reviewer"] = active_curator
-                        df.at[idx, "reviewer_name"] = active_curator_name
+            if record_left_as_canonical and carrier_idx is None:
+                new_row = stamp_batch_record({col: "" for col in df.columns}, ctx)
+                new_row["alignment_id"] = _next_alignment_id(df)
+                new_row["left_source"] = left_source
+                new_row["left_term_iri"] = left_iri
+                new_row["left_label"] = left_label
+                new_row["left_definition"] = str(left_row_series.get("left_definition", "") or "")
+                new_row["left_comment"] = str(left_row_series.get("left_comment", "") or "")
+                new_row["left_example"] = str(left_row_series.get("left_example", "") or "")
+                new_row["left_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
+                new_row["status"] = "approved"
+                new_row["canonical_from"] = "left"
+                new_row["canonical_term_iri"] = left_iri
+                new_row["canonical_term_label"] = left_label
+                new_row["canonical_term_source"] = left_source
+                new_row["canonical_term_kind"] = str(left_row_series.get("left_term_kind", "") or "")
+                new_row["relation"] = ""
+                new_row["suggestion_source"] = "manual_curated"
+                new_row["curator"] = "auto"
+                new_row["curator_name"] = ""
+                new_row["reviewer"] = active_curator
+                new_row["reviewer_name"] = active_curator_name
+                new_row["date_added"] = utc_now_timestamp()
+                new_row["logs"] = "Kept current source term; recorded source term as canonical."
+                new_row["curation_comment"] = curation_comment.strip()
+                df = pd.concat([df, pd.DataFrame([new_row], columns=df.columns)], ignore_index=True)
+                _set_review_fields(df, int(df.index[-1]), active_curator)
 
-                kept_left_terms.discard(left_term_key)
-                st.session_state[STATE_KEPT_LEFT_TERMS] = sorted(kept_left_terms)
-                st.session_state[STATE_DIRTY] = True
-                _mark_review_sync_iri(left_iri)
-                st.session_state[STATE_LEFT_TERM_INDEX] = min(selected_idx + 1, len(left_keys) - 1)
-                st.session_state[STATE_SELECTED_ALIGNMENT] = ""
-                st.rerun()
+            pending_approvals[left_term_key] = []
+            st.session_state[STATE_PENDING_APPROVALS] = pending_approvals
+            st.session_state[STATE_DF] = df
+            st.session_state[STATE_DIRTY] = True
+            _mark_review_sync_iri(left_iri)
+            st.session_state[STATE_LEFT_TERM_INDEX] = min(selected_idx + 1, len(left_keys) - 1)
+            st.session_state[STATE_SELECTED_ALIGNMENT] = ""
+            st.rerun()
 
         skip_col = st.columns([1, 2, 1])[1]
         if skip_col.button("Skip term", key=f"skip_term_{left_term_key}", use_container_width=True):

@@ -11,8 +11,8 @@ import pandas as pd
 import streamlit as st
 
 from curation_app.config import DEFAULT_OLS_ONTOLOGIES_FILE
-from curation_app.context import active_source_context
-from curation_app.helpers import read_tsv, to_relpath, utc_now_timestamp, write_tsv
+from curation_app.context import active_alignment_context, stamp_batch_metadata
+from curation_app.helpers import normalize_source_value, read_tsv, to_relpath, utc_now_timestamp, write_tsv
 from curation_app.pages.curate_candidates import (
     REQUIRED_COLUMNS,
     _bioportal_search_url,
@@ -262,9 +262,9 @@ def render() -> None:
     st.title("Add Terms")
     st.caption("Create missing source terms (class/property) and optional mapping candidates for curation.")
 
-    ctx = active_source_context()
+    ctx = active_alignment_context()
     if ctx is None:
-        st.warning("No source slug available. Configure sources in Fetch schemas first.")
+        st.warning("No alignment batch found. Configure registry/alignment_batches.tsv first.")
         return
 
     active_curator = str(st.session_state.get(STATE_CURATOR, "") or "").strip()
@@ -273,11 +273,11 @@ def render() -> None:
         st.error("Set a valid Curator ORCID with a resolvable public name in the left sidebar before adding terms.")
         return
 
-    st.caption(f"Active source: `{ctx.source_label}`")
+    st.caption(f"Active batch: `{ctx.batch_label}`")
     st.caption(f"Active curator: `{active_curator_name}` ({active_curator})")
-    st.caption(f"Terms file: `{to_relpath(ctx.terms_tsv)}`")
-    st.caption(f"Review ledger: `{to_relpath(ctx.review_tsv)}`")
-    st.caption(f"Local queue: `{to_relpath(ctx.queue_tsv)}`")
+    st.caption(f"Pivot terms file: `{to_relpath(ctx.terms_tsv)}`")
+    st.caption(f"Batch review ledger: `{to_relpath(ctx.review_tsv)}`")
+    st.caption(f"Batch queue: `{to_relpath(ctx.queue_tsv)}`")
 
     relation_catalog, catalog_msg = _load_mapping_relations_from_local_ontologies()
     relation_options: list[str] = []
@@ -590,7 +590,7 @@ def render() -> None:
 
         new_rows: list[dict[str, str]] = []
         now_ts = utc_now_timestamp()
-        left_source = ctx.source_label
+        left_source = normalize_source_value(ctx.source_id)
         left_norm = _normalize_label(label)
 
         for hit in selected_rows:
@@ -613,7 +613,7 @@ def render() -> None:
             entry["left_comment"] = left_comment.strip()
             entry["left_example"] = left_example.strip()
             entry["left_term_kind"] = left_kind
-            entry["right_source"] = str(hit.get("ontology", "")).strip().upper()
+            entry["right_source"] = normalize_source_value(hit.get("ontology", ""))
             entry["right_term_iri"] = right_iri
             entry["right_label"] = str(hit.get("label", "")).strip() or right_iri
             entry["right_definition"] = str(hit.get("definition", "")).strip()
@@ -667,7 +667,7 @@ def render() -> None:
                 entry["left_comment"] = left_comment.strip()
                 entry["left_example"] = left_example.strip()
                 entry["left_term_kind"] = left_kind
-                entry["right_source"] = "MANUAL"
+                entry["right_source"] = "manual"
                 entry["right_term_iri"] = ""
                 entry["right_label"] = "(no mapping selected yet)"
                 entry["right_definition"] = ""
@@ -700,7 +700,7 @@ def render() -> None:
                 cand_df = pd.concat([cand_df, pd.DataFrame([entry], columns=cand_df.columns)], ignore_index=True)
 
         write_tsv(terms_df, ctx.terms_tsv)
-        write_tsv(cand_df, ctx.queue_tsv)
+        write_tsv(stamp_batch_metadata(cand_df, ctx), ctx.queue_tsv)
 
         st.success(
             f"Term {term_action}: `{label}`. Added {len(new_rows)} row(s) to the local queue."

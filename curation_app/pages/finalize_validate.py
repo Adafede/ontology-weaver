@@ -8,7 +8,7 @@ import re
 import pandas as pd
 import streamlit as st
 
-from curation_app.context import active_source_context
+from curation_app.context import active_alignment_context, stamp_batch_metadata
 from curation_app.helpers import (
     file_to_bytes,
     read_tsv,
@@ -537,17 +537,18 @@ def _apply_view(df: pd.DataFrame, view: str) -> pd.DataFrame:
 def render() -> None:
     st.title("Review and Export")
 
-    ctx = active_source_context()
+    ctx = active_alignment_context()
     if ctx is None:
-        st.warning("No source slug available. Configure Download External Sources first.")
+        st.warning("No alignment batch found. Configure registry/alignment_batches.tsv first.")
         return
 
     candidates_path = ctx.review_tsv
-    df = _ensure_columns(read_tsv(candidates_path))
+    df = stamp_batch_metadata(_ensure_columns(read_tsv(candidates_path)), ctx)
     if df.empty and not candidates_path.is_file():
         st.warning("No reviewed ledger file found yet. Please validate items in Curate candidates first.")
         return
 
+    st.caption(f"Batch: `{ctx.batch_label}`")
     st.caption(f"Dataset: `{to_relpath(candidates_path)}`")
 
     view = st.selectbox("View", options=VIEW_OPTIONS, index=1)
@@ -647,8 +648,8 @@ def render() -> None:
 
     export_dir = Path("registry/exports")
     export_dir.mkdir(parents=True, exist_ok=True)
-    ttl_path = export_dir / f"{ctx.source_id}_updated.ttl"
-    mapping_path = export_dir / f"{ctx.source_id}_mappings.ttl"
+    ttl_path = export_dir / f"{ctx.batch_id}_updated.ttl"
+    mapping_path = export_dir / f"{ctx.batch_id}_mappings.ttl"
 
     col1, col2 = st.columns(2)
     with col1:
@@ -665,7 +666,7 @@ def render() -> None:
             data=ttl_text.encode("utf-8"),
             file_name=ttl_path.name,
             mime="text/turtle",
-            key=f"download_ttl_{ctx.source_id}",
+            key=f"download_ttl_{ctx.batch_id}",
         )
 
     if ttl_path.is_file():
@@ -675,7 +676,7 @@ def render() -> None:
             data=file_to_bytes(ttl_path),
             file_name=ttl_path.name,
             mime="text/turtle",
-            key=f"download_ttl_written_{ctx.source_id}",
+            key=f"download_ttl_written_{ctx.batch_id}",
         )
     if emit_mapping_triples and write_mapping_file and mapping_path.is_file():
         st.caption(f"Latest mapping TTL: `{to_relpath(mapping_path)}`")
@@ -684,5 +685,5 @@ def render() -> None:
             data=file_to_bytes(mapping_path),
             file_name=mapping_path.name,
             mime="text/turtle",
-            key=f"download_mapping_written_{ctx.source_id}",
+            key=f"download_mapping_written_{ctx.batch_id}",
         )
