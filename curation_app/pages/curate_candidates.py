@@ -2271,7 +2271,10 @@ def render() -> None:
                     _add_manual_candidate_row(iri, ontology_id, source="manual")
         pending_for_term = st.session_state.get(STATE_PENDING_APPROVALS, {}).get(left_term_key, [])
         if left_is_kept:
-            st.caption("Current source term is selected for approval.")
+            if pending_for_term:
+                st.caption("Current source term is selected to anchor the queued relationship mapping(s).")
+            else:
+                st.caption("Current source term is selected for approval.")
         if pending_for_term:
             st.markdown(f"**{len(pending_for_term)} mapping(s) queued for approval:**")
             for pending_item in pending_for_term:
@@ -2326,15 +2329,16 @@ def render() -> None:
             mask = (df["left_source"] == left_source) & (df["left_term_iri"] == left_iri)
             idxs = df.index[mask].tolist()
 
+            record_left_as_canonical = left_is_kept and not approved_ids
             carrier_idx = None
-            if left_is_kept:
+            if record_left_as_canonical:
                 candidate_carriers = [idx for idx in idxs if str(df.at[idx, "alignment_id"] or "") not in approved_ids]
                 carrier_idx = candidate_carriers[0] if candidate_carriers else None
 
             for idx in idxs:
                 existing_logs = str(df.at[idx, "logs"] or "").strip()
                 alignment_id = str(df.at[idx, "alignment_id"] or "")
-                if left_is_kept and idx == carrier_idx:
+                if record_left_as_canonical and idx == carrier_idx:
                     df.at[idx, "status"] = "approved"
                     df.at[idx, "canonical_from"] = "left"
                     df.at[idx, "canonical_term_iri"] = df.at[idx, "left_term_iri"]
@@ -2367,7 +2371,7 @@ def render() -> None:
                 df.at[idx, "curation_comment"] = curation_comment.strip()
                 _set_review_fields(df, idx, active_curator)
 
-            if left_is_kept and carrier_idx is None:
+            if record_left_as_canonical and carrier_idx is None:
                 new_row = stamp_batch_record({col: "" for col in df.columns}, ctx)
                 new_row["alignment_id"] = _next_alignment_id(df)
                 new_row["left_source"] = left_source
