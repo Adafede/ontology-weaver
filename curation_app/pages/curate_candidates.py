@@ -717,6 +717,116 @@ def _curie_for_iri(iri: str) -> str:
     return iri
 
 
+@st.cache_resource(show_spinner=False)
+def _load_local_source_graph(path_text: str) -> tuple[Graph | None, str]:
+    resolved = to_path(path_text)
+    if not resolved.is_file():
+        return None, f"source TTL not found at `{to_relpath(resolved)}`"
+
+    graph = Graph()
+    try:
+        guessed = _guess_rdf_format(resolved)
+        if guessed:
+            graph.parse(resolved, format=guessed)
+        else:
+            graph.parse(resolved)
+    except Exception as exc:
+        return None, f"failed to parse `{to_relpath(resolved)}`: {exc}"
+    return graph, ""
+
+
+def _graph_display_iri(graph: Graph, iri: str) -> str:
+    term_ref = URIRef(iri)
+    try:
+        prefix, _, local_name = graph.compute_qname(term_ref)
+        qname = f"{prefix}:{local_name}" if prefix else local_name
+    except Exception:
+        qname = ""
+
+    if qname and qname != iri:
+        return qname
+
+    for obj in graph.objects(term_ref, RDFS.label):
+        label = str(obj or "").strip()
+        if label:
+            return label
+
+    fallback = _curie_for_iri(iri)
+    if fallback != iri:
+        return fallback
+    return _short_local_name(iri)
+
+
+def _collect_uri_neighbors(graph: Graph, iri: str, predicate: URIRef, mode: str) -> list[str]:
+    term_ref = URIRef(iri)
+    nodes: list[str] = []
+    if mode in {"out", "both"}:
+        nodes.extend(str(obj) for obj in graph.objects(term_ref, predicate) if isinstance(obj, URIRef))
+    if mode in {"in", "both"}:
+        nodes.extend(str(subj) for subj in graph.subjects(predicate, term_ref) if isinstance(subj, URIRef))
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for node_iri in nodes:
+        clean = str(node_iri or "").strip()
+        if not clean or clean == iri or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean)
+    deduped.sort(key=lambda value: _graph_display_iri(graph, value).lower())
+    return deduped
+
+
+def _local_term_context(
+    *,
+    ttl_path_text: str,
+    term_iri: str,
+    term_kind: str,
+) -> tuple[list[tuple[str, list[tuple[str, str]]]], str]:
+    graph, error = _load_local_source_graph(ttl_path_text)
+    if graph is None:
+        return [], error
+
+    normalized_kind = _normalize_kind(term_kind)
+    if normalized_kind == "property":
+        specs = [
+            ("Parent properties", RDFS.subPropertyOf, "out"),
+            ("Child properties", RDFS.subPropertyOf, "in"),
+            ("Equivalent properties", OWL.equivalentProperty, "both"),
+            ("Domain", RDFS.domain, "out"),
+            ("Range", RDFS.range, "out"),
+            ("See also", RDFS.seeAlso, "out"),
+        ]
+    elif normalized_kind == "individual":
+        specs = [
+            ("Types", RDF.type, "out"),
+            ("Same as", OWL.sameAs, "both"),
+            ("See also", RDFS.seeAlso, "out"),
+        ]
+    else:
+        specs = [
+            ("Parent classes", RDFS.subClassOf, "out"),
+            ("Child classes", RDFS.subClassOf, "in"),
+            ("Equivalent classes", OWL.equivalentClass, "both"),
+            ("Same as", OWL.sameAs, "both"),
+            ("See also", RDFS.seeAlso, "out"),
+        ]
+
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+    for title, predicate, mode in specs:
+        iris = _collect_uri_neighbors(graph, term_iri, predicate, mode)
+        if not iris:
+            continue
+        sections.append((title, [(iri, _graph_display_iri(graph, iri)) for iri in iris]))
+    return sections, ""
+
+
+def _linked_resource_html(iri: str, display: str) -> str:
+    escaped_iri = html.escape(str(iri or "").strip())
+    escaped_display = html.escape(str(display or "").strip() or str(iri or "").strip())
+    return f'<a href="{escaped_iri}" target="_blank"><code>{escaped_display}</code></a>'
+
+
 def _build_mapping_relation_entries(merged: Graph) -> list[dict[str, str]]:
     skos_mapping_root = SKOS.mappingRelation
     skos_candidates: set[URIRef] = {skos_mapping_root}
@@ -1845,6 +1955,22 @@ def render() -> None:
                     ("Example", str(left_row_series.get("left_example", "") or "-")),
                 ],
             )
+            local_context_sections, local_context_error = _local_term_context(
+                ttl_path_text=str(ctx.download_ttl),
+                term_iri=str(left_iri),
+                term_kind=str(left_row_series.get("left_term_kind", "") or ""),
+            )
+            if local_context_sections:
+                st.markdown("**Known local context**")
+                st.caption(f"Direct asserted relationships from `{to_relpath(ctx.download_ttl)}`.")
+                for section_title, section_items in local_context_sections:
+                    links = ", ".join(_linked_resource_html(iri, display) for iri, display in section_items)
+                    st.markdown(
+                        f'<div class="card-row"><strong>{html.escape(section_title)}:</strong> {links}</div>',
+                        unsafe_allow_html=True,
+                    )
+            elif local_context_error:
+                st.caption(f"Known local context unavailable: {local_context_error}")
             relation_bound_pending = [
                 item
                 for item in pending_approvals.get(left_term_key, [])
