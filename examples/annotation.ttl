@@ -1,0 +1,37 @@
+@prefix ex: <https://example.org/enpkg/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix schema: <https://schema.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:spectrum_001
+    ex:annotatedAs ex:CHEBI_16811
+    {| 
+        a ex:MetaboliteAnnotation ;
+        prov:wasGeneratedBy ex:annotation_run_2026_07_03_001 ;
+        ex:annotationScore 0.87 ;
+        ex:rank 1 ;
+        ex:adduct "[M+H]+" ;
+        ex:ionizationMode "positive" ;
+        ex:confidenceLevel "candidate structure" ;
+    |} .
+
+ex:annotation_run_2026_07_03_001
+    a prov:Activity, ex:SpectralAnnotationRun ;
+    prov:used ex:spectrum_001 ;
+    prov:used ex:sirius_6_0_5 ;
+    prov:generated ex:CHEBI_16811 ;
+    ex:hasParameter [
+        ex:parameterName "ppmMax" ;
+        ex:parameterValue "10"^^xsd:decimal
+    ], [
+        ex:parameterName "profile" ;
+        ex:parameterValue "orbitrap"
+    ], [
+        ex:parameterName "formulaSearch" ;
+        ex:parameterValue true
+    ] .
+
+ex:sirius_6_0_5
+    a schema:SoftwareApplication ;
+    schema:name "SIRIUS" ;
+    schema:softwareVersion "6.0.5" .
