@@ -16,8 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from curation_app.pages.view_schema import _build_mermaid, _write_merged_ttl
-from scripts.export_updated_ttl import build_exports_for_ledger
+from curation_app.pages.view_schema import _build_mermaid, _write_merged_ttl  # noqa: E402
+from scripts.export_updated_ttl import build_exports_for_ledger  # noqa: E402
 
 MARKER = "<!-- pr-mermaid-review -->"
 LEDGER_PATTERN = re.compile(r"^registry/pair_alignment_candidates_([A-Za-z0-9_.-]+)\.tsv$")
@@ -104,6 +104,37 @@ def read_current_tsv(path: Path) -> dict[str, dict[str, str]]:
     return read_tsv_text(path.read_text(encoding="utf-8", errors="replace"))
 
 
+def source_ttl_candidates(ledger_path: Path, source_slug: str) -> list[Path]:
+    slugs: list[str] = []
+
+    def add_slug(value: str) -> None:
+        slug = str(value or "").strip().lower()
+        if slug and slug not in slugs:
+            slugs.append(slug)
+
+    if ledger_path.is_file():
+        with ledger_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                add_slug(row.get("pivot_source", ""))
+                add_slug(row.get("source_term_source", ""))
+                break
+
+    add_slug(source_slug)
+    return [Path("registry/downloads") / f"{slug}.ttl" for slug in slugs]
+
+
+def resolve_source_ttl_path(ledger_path: Path, source_slug: str) -> Path:
+    candidates = source_ttl_candidates(ledger_path, source_slug)
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"No downloaded source TTL found for `{ledger_path}`. Tried: "
+        + ", ".join(path.as_posix() for path in candidates)
+    )
+
+
 def changed_rows(old_rows: dict[str, dict[str, str]], new_rows: dict[str, dict[str, str]]) -> list[dict[str, str]]:
     changed: list[dict[str, str]] = []
     keys = sorted(set(old_rows) | set(new_rows))
@@ -121,11 +152,9 @@ def changed_rows(old_rows: dict[str, dict[str, str]], new_rows: dict[str, dict[s
 
 def build_compare_ttls(source_slug: str, tmpdir: Path) -> tuple[Path, Path]:
     ledger_path = Path("registry") / f"pair_alignment_candidates_{source_slug}.tsv"
-    source_ttl_path = Path("registry/downloads") / f"{source_slug}.ttl"
     if not ledger_path.is_file():
         raise FileNotFoundError(ledger_path)
-    if not source_ttl_path.is_file():
-        raise FileNotFoundError(source_ttl_path)
+    source_ttl_path = resolve_source_ttl_path(ledger_path, source_slug)
 
     _, mapping_ttl_text = build_exports_for_ledger(
         ledger_path=ledger_path,

@@ -1,0 +1,174 @@
+@prefix ex: <https://example.org/enpkg/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix schema: <https://schema.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Spectra
+#################################################################
+
+ex:spectrum_001 a ex:MassSpectrum .
+ex:spectrum_002 a ex:MassSpectrum .
+ex:spectrum_003 a ex:MassSpectrum .
+
+#################################################################
+# Tools
+#################################################################
+
+ex:sirius_6_0_5
+    a schema:SoftwareApplication ;
+    schema:name "SIRIUS" ;
+    schema:softwareVersion "6.0.5" .
+
+ex:msfinder_3_60
+    a schema:SoftwareApplication ;
+    schema:name "MS-FINDER" ;
+    schema:softwareVersion "3.60" .
+
+ex:matchms_0_27_0
+    a schema:SoftwareApplication ;
+    schema:name "matchms" ;
+    schema:softwareVersion "0.27.0" .
+
+#################################################################
+# Annotation batches / runs
+#################################################################
+
+ex:annotation_batch_sirius_001
+    a prov:Activity, ex:AnnotationBatch ;
+    prov:used ex:sirius_6_0_5 ;
+    prov:used ex:spectrum_001, ex:spectrum_002, ex:spectrum_003 ;
+    ex:hasParameter [
+        ex:parameterName "ppmMax" ;
+        ex:parameterValue "10"^^xsd:decimal
+    ], [
+        ex:parameterName "database" ;
+        ex:parameterValue "CSI:FingerID"
+    ] .
+
+ex:annotation_batch_msfinder_001
+    a prov:Activity, ex:AnnotationBatch ;
+    prov:used ex:msfinder_3_60 ;
+    prov:used ex:spectrum_001, ex:spectrum_002, ex:spectrum_003 ;
+    ex:hasParameter [
+        ex:parameterName "massToleranceDa" ;
+        ex:parameterValue "0.01"^^xsd:decimal
+    ], [
+        ex:parameterName "database" ;
+        ex:parameterValue "HMDB+PubChem"
+    ] .
+
+#################################################################
+# Similarity batch / run
+#################################################################
+
+ex:similarity_batch_matchms_001
+    a prov:Activity, ex:SpectralSimilarityBatch ;
+    prov:used ex:matchms_0_27_0 ;
+    prov:used ex:spectrum_001, ex:spectrum_002, ex:spectrum_003 ;
+    ex:hasParameter [
+        ex:parameterName "algorithm" ;
+        ex:parameterValue "modified_cosine"
+    ], [
+        ex:parameterName "minMatchedPeaks" ;
+        ex:parameterValue 6
+    ] .
+
+#################################################################
+# Spectral similarity edges using RDF-star
+#################################################################
+
+ex:spectrum_001 ex:hasSpectralSimilarityTo ex:spectrum_002 {|
+    a ex:SpectralSimilarity ;
+    ex:similarityScore "0.91"^^xsd:decimal ;
+    ex:matchedPeaks 18 ;
+    prov:wasGeneratedBy ex:similarity_batch_matchms_001
+|} .
+
+ex:spectrum_001 ex:hasSpectralSimilarityTo ex:spectrum_003 {|
+    a ex:SpectralSimilarity ;
+    ex:similarityScore "0.76"^^xsd:decimal ;
+    ex:matchedPeaks 11 ;
+    prov:wasGeneratedBy ex:similarity_batch_matchms_001
+|} .
+
+ex:spectrum_002 ex:hasSpectralSimilarityTo ex:spectrum_003 {|
+    a ex:SpectralSimilarity ;
+    ex:similarityScore "0.84"^^xsd:decimal ;
+    ex:matchedPeaks 14 ;
+    prov:wasGeneratedBy ex:similarity_batch_matchms_001
+|} .
+
+#################################################################
+# Candidate annotations: SIRIUS batch
+#################################################################
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_A {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 1 ;
+    ex:score "0.96"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_sirius_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_B {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 2 ;
+    ex:score "0.88"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_sirius_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_C {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 3 ;
+    ex:score "0.82"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_sirius_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_D {|
+    ex:rank 4 ;
+    ex:score "0.74"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_sirius_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_E {|
+    ex:rank 5 ;
+    ex:score "0.69"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_sirius_001
+|} .
+
+#################################################################
+# Candidate annotations: MS-FINDER batch
+#################################################################
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_A {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 1 ;
+    ex:score "8.72"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_msfinder_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_F {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 2 ;
+    ex:score "7.95"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_msfinder_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_G {|
+    a ex:MetaboliteAnnotation ;
+    ex:rank 3 ;
+    ex:score "7.51"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_msfinder_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_H {|
+    ex:rank 4 ;
+    ex:score "6.88"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_msfinder_001
+|} .
+
+ex:spectrum_001 ex:hasCandidateStructure ex:compound_I {|
+    ex:rank 5 ;
+    ex:score "6.43"^^xsd:decimal ;
+    prov:wasGeneratedBy ex:annotation_batch_msfinder_001
+|} .
