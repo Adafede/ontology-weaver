@@ -5,11 +5,11 @@ description = "Streamlit workflow for ontology alignment curation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "pandas>=2.2.0",
-  "pylode>=3.2.0,<3.4.0",
+  "pandas>=3.0.6",
+  "pylode>=3.3.4,<3.4.0",
   "pyvis>=0.3.2",
-  "rdflib>=7.0.0",
-  "streamlit>=1.42.0",
+  "rdflib>=7.6.0",
+  "streamlit>=1.64.0",
 ]
 
 [tool.uv]
