@@ -133,6 +133,14 @@ Do not version these generated caches/exports:
 `registry/work/pair_alignment_candidates_<source>.tsv` is the local working queue.
 Use it for focused regeneration and in-progress curation. Only approved decisions are synced back to the shared ledger.
 
+On **Curate candidates**, the default `needs_review` filter also lists extracted source terms
+with no generated matches, even if the local queue is empty. These terms can be kept
+as their own canonical term or given a manual match; selecting **Validate** saves
+the decision to the local queue and shared batch ledger. Terms already approved
+in the shared batch ledger are hidden by default. The progress bar counts unique
+source terms, not candidate pairs; generating candidates only suggests matches
+above the chosen similarity threshold and does not curate every source term.
+
 ## Collaboration workflow (git + PR)
 
 Use shared schema files (no per-curator filenames) and collaborate through branches/PRs.

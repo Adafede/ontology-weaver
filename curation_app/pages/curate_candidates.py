@@ -1731,23 +1731,34 @@ def render() -> None:
     df = stamp_batch_metadata(st.session_state[STATE_DF], ctx)
     st.session_state[STATE_DF] = df
     review_df = stamp_batch_metadata(read_tsv(review_file), ctx)
-    if df.empty and not to_path(queue_file).is_file():
-        st.warning("No local queue found for this batch. Please run Generate Pairwise Candidates first.")
+    source_terms_df = read_tsv(ctx.terms_tsv)
+    if df.empty and source_terms_df.empty:
+        st.warning(
+            "No local queue or extracted source terms found for this batch. Extract terms or generate candidates first."
+        )
         return
 
-    term_groups = (
-        df.groupby(["left_source", "left_term_iri"], dropna=False)["status"]
-        .apply(lambda series: any(str(value) == "needs_review" for value in series))
-        .reset_index(name="has_needs_review")
+    approved_shared_iris = (
+        set(review_df["source_term_iri"].astype(str).str.strip()) - {""}
+        if "source_term_iri" in review_df.columns
+        else set()
     )
-    total_terms = len(term_groups)
-    needs_review_terms = int(term_groups["has_needs_review"].sum()) if total_terms else 0
-    curated_terms = max(0, total_terms - needs_review_terms)
+    queued_iris = set(df["left_term_iri"].astype(str).str.strip()) - {""}
+    source_iris = (
+        set(source_terms_df["iri"].astype(str).str.strip()) - {""}
+        if "iri" in source_terms_df.columns
+        else set()
+    )
+    term_groups = df.groupby("left_term_iri")["status"].apply(lambda statuses: "needs_review" not in set(statuses))
+    processed_iris = approved_shared_iris | set(term_groups[term_groups].index)
+    all_iris = source_iris | queued_iris
+    total_terms = len(all_iris)
+    curated_terms = len(all_iris & processed_iris)
     progress = (curated_terms / total_terms) if total_terms else 0.0
 
-    st.subheader("Local Queue Progress")
-    st.caption("Counts source terms in the local queue that no longer have any `needs_review` rows.")
-    st.progress(progress, text=f"{curated_terms}/{total_terms} term(s) processed locally ({progress * 100:.1f}%)")
+    st.subheader("Source Term Progress")
+    st.caption("Counts extracted source terms and queued terms approved in the shared ledger or processed locally.")
+    st.progress(progress, text=f"{curated_terms}/{total_terms} term(s) processed ({progress * 100:.1f}%)")
 
     shared_terms = int(review_df["source_term_iri"].astype(str).str.strip().ne("").sum()) if not review_df.empty else 0
     with st.expander(f"Shared Approved Decisions ({shared_terms})", expanded=False):
@@ -1784,7 +1795,8 @@ def render() -> None:
             render_clickable_dataframe(shared_display_df, use_container_width=True, hide_index=True)
 
     st.subheader("Filter")
-    available_statuses = sorted(df["status"].dropna().unique().tolist())
+    unqueued_iris = source_iris - queued_iris - approved_shared_iris
+    available_statuses = sorted(set(df["status"].dropna().unique()) | ({"needs_review"} if unqueued_iris else set()))
     default_statuses = ["needs_review"] if "needs_review" in available_statuses else available_statuses
     selected_statuses = st.multiselect(
         "Status",
@@ -1804,16 +1816,10 @@ def render() -> None:
     filtered = _filtered_df(df, selected_statuses, search_text)
     reviewable_filtered = filtered.copy()
     hidden_shared_rows = 0
-    if not include_shared_approved and not review_df.empty and "source_term_iri" in review_df.columns:
-        approved_shared_iris = {
-            str(value or "").strip()
-            for value in review_df["source_term_iri"].astype(str).tolist()
-            if str(value or "").strip()
-        }
-        if approved_shared_iris:
-            mask = reviewable_filtered["left_term_iri"].astype(str).isin(approved_shared_iris)
-            hidden_shared_rows = int(mask.sum())
-            reviewable_filtered = reviewable_filtered.loc[~mask].copy()
+    if not include_shared_approved and approved_shared_iris:
+        mask = reviewable_filtered["left_term_iri"].astype(str).isin(approved_shared_iris)
+        hidden_shared_rows = int(mask.sum())
+        reviewable_filtered = reviewable_filtered.loc[~mask].copy()
     if hidden_shared_rows:
         st.caption(f"Filtered rows: {len(filtered)} | hidden because already approved in shared ledger: {hidden_shared_rows}")
     else:
@@ -1834,6 +1840,24 @@ def render() -> None:
         .drop_duplicates()
         .copy()
     )
+    if unqueued_iris and (not selected_statuses or "needs_review" in selected_statuses):
+        unqueued = source_terms_df[source_terms_df["iri"].isin(unqueued_iris)]
+        source = str(df["left_source"].iloc[0]) if not df.empty else normalize_source_value(ctx.pivot_source)
+        source_rows = unqueued.rename(
+            columns={
+                "iri": "left_term_iri",
+                "label": "left_label",
+                "term_kind": "left_term_kind",
+                "definition": "left_definition",
+                "comment": "left_comment",
+                "example": "left_example",
+            }
+        )
+        source_rows = source_rows.assign(left_source=source)
+        left_terms_df = pd.concat(
+            [left_terms_df, source_rows.reindex(columns=left_terms_df.columns, fill_value="")],
+            ignore_index=True,
+        )
 
     token = search_text.strip().lower()
     if token:
@@ -1842,9 +1866,14 @@ def render() -> None:
     left_terms_df = left_terms_df.drop_duplicates(subset=["left_source", "left_term_iri", "left_label"]).reset_index(
         drop=True
     )
+    if unqueued_iris and (not selected_statuses or "needs_review" in selected_statuses):
+        st.caption(
+            f"{len(unqueued_iris)} extracted source term(s) have no generated candidates; "
+            "select one to keep it or add a manual match."
+        )
 
     if left_terms_df.empty:
-        st.info("No left terms available for current filters. Generate or reload candidates first.")
+        st.info("No left terms available for the selected status and search filters.")
     else:
         left_keys = list(left_terms_df[["left_source", "left_term_iri", "left_label"]].itertuples(index=False, name=None))
         if STATE_LEFT_TERM_INDEX not in st.session_state:
